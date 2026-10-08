@@ -6,11 +6,23 @@ road-graph edges between those sensors.
 
 ## Setup
 
+With `venv` and pip:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Or with conda:
+
+```bash
+conda env create -f environment.yaml
+conda activate gml
+```
+
+After changing `environment.yaml`, update the environment with
+`conda env update -f environment.yaml --prune`.
 
 Put the raw dataset files in `data/` (it is git-ignored):
 

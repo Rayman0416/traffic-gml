@@ -158,7 +158,7 @@ def nearest_sensor(sensors, lat, lon, candidates):
     return int(d2.idxmin())
 
 
-def select_subgraph(graph, sensors, coverage, n_nodes=500, min_coverage=0.8, centre=MADRID_CENTRE, max_nan_run=5000, path=READINGS_PARQUET):
+def select_subgraph(graph, sensors, coverage, n_nodes=500, min_coverage=0.8, centre=MADRID_CENTRE, max_nan_run=500, path=READINGS_PARQUET):
     """
     Grow a connected region of n_nodes well-covered sensors outward from centre.
     Candidates are sensors with at least min_coverage valid training readings.

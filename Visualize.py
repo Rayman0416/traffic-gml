@@ -44,21 +44,6 @@ def load_readings(path):
 
 
 # image building ------------------------------------------------------------
-
-def sensor_order(intensity, sensor_ids=None, sort="stored"):
-    """Row order for the sensors: 'stored' (as in the file), 'id', or 'missing' (least NaN first)."""
-    n = intensity.shape[1]
-    if sort == "stored":
-        return np.arange(n)
-    if sort == "id":
-        if sensor_ids is None:
-            raise ValueError("sort='id' needs sensor_ids")
-        return np.argsort(sensor_ids, kind="stable")
-    if sort == "missing":
-        return np.argsort(np.isnan(intensity).mean(axis=0), kind="stable")
-    raise ValueError(f"unknown sort {sort!r}")
-
-
 def slice_time(intensity, timestamps, start=None, end=None):
     """Restrict to timestamps in [start, end). Either bound may be None."""
     mask = np.ones(len(timestamps), dtype=bool)
@@ -193,14 +178,13 @@ def draw_graph(sensors, edges, out_path, title=None, node_size=8, edge_width=0.5
 
 # high-level entry point ------------------------------------------------------------
 
-def make_picture(intensity, timestamps, out_path, sensor_ids=None, sort="stored",
+def make_picture(intensity, timestamps, out_path, sensor_ids=None,
                  start=None, end=None, time_bin=1, x_scale=1, y_scale=1,
                  annotate=False, title=None):
     """Build and save one picture from in-memory arrays. Returns the uint8 image [N, T']."""
     intensity, timestamps = slice_time(intensity, timestamps, start, end)
     if intensity.shape[0] == 0:
         raise ValueError("no time steps left after slicing")
-    intensity = intensity[:, sensor_order(intensity, sensor_ids, sort)]
     img = to_image(intensity, time_bin)
 
     out_path = Path(out_path)
@@ -230,7 +214,6 @@ def main():
     p.add_argument("--time-bin", type=int, default=1, help="time steps per pixel column (96 = one day at 15 min)")
     p.add_argument("--x-scale", type=int, default=1, help="pixel enlargement along time (plain image)")
     p.add_argument("--y-scale", type=int, default=1, help="pixel enlargement along sensors (plain image)")
-    p.add_argument("--sort", choices=["stored", "id", "missing"], default="stored", help="sensor row order")
     p.add_argument("--annotate", action="store_true", help="figure with axes and legend")
     args = p.parse_args()
 
@@ -238,7 +221,7 @@ def main():
         sensor_ids, timestamps, intensity = load_readings(path)
         name = (path.parent.name if path.suffix == ".npz" else path.name) or "dataset"
         out = Path(args.out_dir) / f"{name}{args.suffix}.png"
-        img = make_picture(intensity, timestamps, out, sensor_ids, args.sort, args.start, args.end,
+        img = make_picture(intensity, timestamps, out, sensor_ids, args.start, args.end,
                            args.time_bin, args.x_scale, args.y_scale, args.annotate, title=name)
         print(f"{path}: {intensity.shape[1]} sensors x {intensity.shape[0]:,} steps -> "
               f"{img.shape[1]}x{img.shape[0]} px, {_stats(intensity)}; saved {out}")

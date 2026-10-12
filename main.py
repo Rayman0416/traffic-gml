@@ -4,6 +4,7 @@ import numpy as np
 import preprocess
 from pathlib import Path
 import Visualize
+import create_masked_data
 
 def main():
 	# Parse CLI arguments
@@ -15,6 +16,7 @@ def main():
 	parser.add_argument("--max-nan-run", type=int, default=500, help="exclude sensors with more than this many consecutive NaN time steps")
 	parser.add_argument("--plot", action="store_true", default=True, help="save pictures of the grid and graph")
 	parser.add_argument("--plot-dir", default="figures", help="where to save the pictures")
+	parser.add_argument("--create-masked-data", action="store_true", default=True, help="create normalized and ground-truth subgraph datasets",)
 	args = parser.parse_args()
 
 	# Convert the raw CSV to Parquet for faster reads/memory efficiency in later steps
@@ -60,10 +62,15 @@ def main():
 	#Visual
 	if args.plot:
 		plot_dir = Path(args.plot_dir)
-		Visualize.make_picture(intensity, timestamps, plot_dir / "grid_cleaned.png",
-							   sensor_ids=subgraph, sort="missing", time_bin=4, y_scale=2)
+		Visualize.make_picture(intensity, timestamps, plot_dir / "grid_cleaned.png", sensor_ids=subgraph, time_bin=4, y_scale=2)
+
 		n_comp = Visualize.draw_graph(sensors.loc[subgraph], edges, plot_dir / "graph.png")
 		print(f"pictures saved to {plot_dir}, graph has {n_comp} connected component(s)")
+
+	if args.create_masked_data:
+		stats, gt_intensity = create_masked_data.create_datasets(overwrite=True)
+		Visualize.make_picture(gt_intensity, timestamps, plot_dir / "grid_groundtruth_normal.png", sensor_ids=subgraph, time_bin=4, y_scale=2)
+
 
 if __name__ == "__main__":
     main()

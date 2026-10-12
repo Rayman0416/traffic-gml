@@ -2,7 +2,8 @@ import argparse
 import networkx as nx
 import numpy as np
 import preprocess
-
+from pathlib import Path
+import Visualize
 
 def main():
 	# Parse CLI arguments
@@ -44,6 +45,9 @@ def main():
 		f"99th pct {np.nanpercentile(intensity, 99):.0f}, max {np.nanmax(intensity):.0f}")
 	print(f"saved to {preprocess.SUBGRAPH_DIR}")
 
+	#Visual
+	ids, ts, intensity = Visualize.load_readings("data/subgraph")
+	img = Visualize.make_picture(intensity, ts, "figures/a.png", sensor_ids=ids, sort="stored")
 
 if __name__ == "__main__":
     main()

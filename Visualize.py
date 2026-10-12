@@ -15,6 +15,7 @@ Standalone usage (one picture per dataset directory or readings.npz):
 From the main script or a notebook:
     import visualize
     visualize.make_picture(intensity, timestamps, "figures/a.png", time_bin=4)
+    visualize.draw_graph(sensors.loc[sensor_ids], edges, "figures/graph.png")
 """
 
 import argparse
@@ -23,11 +24,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from matplotlib import image as mpimg
+from matplotlib.collections import LineCollection
 from matplotlib.dates import AutoDateLocator, ConciseDateFormatter, date2num
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
-#
-BLACK, GREY, WHITE = 0, 200, 255  # grayscale levels used in the image
+
+BLACK, GREY, WHITE = 0, 128, 255  # grayscale levels used in the image
 
 
 # loading ------------------------------------------------------------
@@ -125,6 +127,68 @@ def save_annotated(img, timestamps, out_path, title=None, dpi=150, figsize=(14, 
     ], loc="upper right", framealpha=0.9)
     fig.tight_layout()
     fig.savefig(out_path, dpi=dpi)
+
+
+# graph drawing ------------------------------------------------------------
+
+def _components(ids, edges):
+    """Connected-component label per sensor id (edges treated as undirected), via union-find."""
+    parent = {i: i for i in ids}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for u, v in zip(edges["source"], edges["target"]):
+        if u in parent and v in parent:
+            parent[find(u)] = find(v)
+    return np.array([find(i) for i in ids])
+
+
+def draw_graph(sensors, edges, out_path, title=None, node_size=8, edge_width=0.5,
+               edge_alpha=0.4, figsize=(10, 10), dpi=200):
+    """Draw the sensors as nodes at their UTM position, with the route-graph edges between them.
+
+    sensors: DataFrame indexed by sensor id with `utm_x` and `utm_y` columns
+             (e.g. the `sensors` returned by load_subgraph, or sensors.loc[subgraph]).
+    edges:   DataFrame with `source` and `target` columns (e.g. from subgraph_edges).
+    Nodes in the largest connected component are blue; nodes outside it are red,
+    so a disconnected region is easy to spot. Edges are drawn without direction.
+    """
+    ids = list(sensors.index)
+    pos = dict(zip(ids, zip(sensors["utm_x"], sensors["utm_y"])))
+
+    # Edges whose two endpoints both have a position
+    inside = [(u, v) for u, v in zip(edges["source"], edges["target"]) if u in pos and v in pos]
+    segments = [(pos[u], pos[v]) for u, v in inside]
+
+    labels = _components(ids, edges)
+    values, counts = np.unique(labels, return_counts=True)
+    in_main = labels == values[np.argmax(counts)]
+    xy = np.array([pos[i] for i in ids])
+
+    fig = Figure(figsize=figsize)
+    ax = fig.subplots()
+    ax.add_collection(LineCollection(segments, colors="0.3", linewidths=edge_width, alpha=edge_alpha))
+    ax.scatter(xy[in_main, 0], xy[in_main, 1], s=node_size, c="tab:blue", zorder=3,
+               label=f"largest component ({in_main.sum()})")
+    if (~in_main).any():
+        ax.scatter(xy[~in_main, 0], xy[~in_main, 1], s=node_size, c="tab:red", zorder=3,
+                   label=f"other components ({(~in_main).sum()})")
+        ax.legend(loc="upper right")
+    ax.set_aspect("equal")  # UTM coordinates are metres, so keep x and y to the same scale
+    ax.autoscale_view()
+    ax.set_xlabel("UTM x (m)")
+    ax.set_ylabel("UTM y (m)")
+    ax.set_title(title or f"{len(ids)} sensors, {len(inside):,} edges, {len(values)} component(s)")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    return len(values)  # number of connected components (1 = fully connected)
 
 
 # high-level entry point ------------------------------------------------------------

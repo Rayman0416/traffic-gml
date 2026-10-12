@@ -13,6 +13,8 @@ def main():
 	parser.add_argument("--overwrite", action="store_true", help="re-convert the raw CSV")
 	parser.add_argument("--max-bad-fraction", type=float, default=0.5, help="discard time steps where more than this fraction of sensors are NaN or 0")
 	parser.add_argument("--max-nan-run", type=int, default=500, help="exclude sensors with more than this many consecutive NaN time steps")
+	parser.add_argument("--plot", action="store_true", default=True, help="save pictures of the grid and graph")
+	parser.add_argument("--plot-dir", default="figures", help="where to save the pictures")
 	args = parser.parse_args()
 
 	# Convert the raw CSV to Parquet for faster reads/memory efficiency in later steps
@@ -30,8 +32,6 @@ def main():
 
 	timestamps, intensity, _ = preprocess.build_grid(subgraph)
 	intensity, n_spikes = preprocess.remove_spikes(timestamps, intensity) # Remove heavy outliers
-
-	intensity, n_spikes = preprocess.remove_spikes(timestamps, intensity)
 	print(f"removed {n_spikes} spike readings (> 3x sensor's training 99th percentile)")
 
 	n_before = len(timestamps)
@@ -58,8 +58,12 @@ def main():
 	print(f"saved to {preprocess.SUBGRAPH_DIR}")
 
 	#Visual
-	ids, ts, intensity = Visualize.load_readings("data/subgraph")
-	img = Visualize.make_picture(intensity, ts, "figures/a.png", sensor_ids=ids, sort="stored")
+	if args.plot:
+		plot_dir = Path(args.plot_dir)
+		Visualize.make_picture(intensity, timestamps, plot_dir / "grid_cleaned.png",
+							   sensor_ids=subgraph, sort="missing", time_bin=4, y_scale=2)
+		n_comp = Visualize.draw_graph(sensors.loc[subgraph], edges, plot_dir / "graph.png")
+		print(f"pictures saved to {plot_dir}, graph has {n_comp} connected component(s)")
 
 if __name__ == "__main__":
     main()

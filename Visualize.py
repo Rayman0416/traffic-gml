@@ -26,8 +26,8 @@ from matplotlib import image as mpimg
 from matplotlib.dates import AutoDateLocator, ConciseDateFormatter, date2num
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
-
-BLACK, GREY, WHITE = 0, 128, 255  # grayscale levels used in the image
+#
+BLACK, GREY, WHITE = 0, 200, 255  # grayscale levels used in the image
 
 
 # loading ------------------------------------------------------------

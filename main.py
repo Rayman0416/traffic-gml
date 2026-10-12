@@ -11,6 +11,7 @@ def main():
 	parser.add_argument("--n-nodes", type=int, default=500, help="number of sensors in the subgraph region")
 	parser.add_argument("--min-coverage", type=float, default=0.8, help="minimum fraction of valid training readings per sensor")
 	parser.add_argument("--overwrite", action="store_true", help="re-convert the raw CSV")
+	parser.add_argument("--max-bad-fraction", type=float, default=0.5, help="discard time steps where more than this fraction of sensors are NaN or 0")
 	args = parser.parse_args()
 
 	# Convert the raw CSV to Parquet for faster reads/memory efficiency in later steps
@@ -27,8 +28,17 @@ def main():
 	subgraph = preprocess.select_subgraph(graph, sensors, coverage, args.n_nodes, args.min_coverage)
 	timestamps, intensity, _ = preprocess.build_grid(subgraph)
 	intensity, n_spikes = preprocess.remove_spikes(timestamps, intensity) # Remove heavy outliers
-	valid = ~np.isnan(intensity)
+
+	intensity, n_spikes = preprocess.remove_spikes(timestamps, intensity)
 	print(f"removed {n_spikes} spike readings (> 3x sensor's training 99th percentile)")
+
+	n_before = len(timestamps)
+	timestamps, intensity, n_outage = preprocess.remove_outage_steps(timestamps, intensity, args.max_bad_fraction)
+	print(f"removed {n_outage:,} of {n_before:,} time steps "
+		  f"(> {args.max_bad_fraction:.0%} of sensors NaN or 0)")
+
+	valid = ~np.isnan(intensity)
+
 	edges = preprocess.subgraph_edges(graph, subgraph)
 	preprocess.save_subgraph(subgraph, timestamps, intensity, edges, sensors)
 

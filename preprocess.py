@@ -261,3 +261,14 @@ def load_subgraph(out_dir=SUBGRAPH_DIR):
         pd.read_csv(out_dir / "edges.csv"),
         pd.read_csv(out_dir / "sensors.csv", index_col="id"),
     )
+
+def remove_outage_steps(timestamps, intensity, max_bad_fraction=0.5, drop=True):
+    bad = np.isnan(intensity)
+    outage = bad.mean(axis=1) > max_bad_fraction
+
+    if drop:
+        return timestamps[~outage], intensity[~outage], int(outage.sum())
+
+    cleaned = intensity.copy()
+    cleaned[outage] = np.nan
+    return timestamps, cleaned, int(outage.sum())

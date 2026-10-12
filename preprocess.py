@@ -201,7 +201,7 @@ def _dist(sensors, a, b):
 
 # regular grid -------------------------------------------------------- 
 
-def build_grid(sensor_ids, path=READINGS_PARQUET):
+def build_grid(sensor_ids, path=READINGS_PARQUET, zeros_to_nan=False):
     """Readings for `sensor_ids` on a regular 15-minute grid covering all of 2024.
 
     Returns (timestamps, intensity, valid) where intensity is float32 [T, N]
@@ -221,6 +221,10 @@ def build_grid(sensor_ids, path=READINGS_PARQUET):
     keep = row >= 0  # drop readings that are off the 15-minute grid
     intensity = np.full((len(timestamps), len(sensor_ids)), np.nan, dtype=np.float32)
     intensity[row[keep], col[keep]] = df["traffic_intensity"].to_numpy()[keep]
+
+    if zeros_to_nan:
+        intensity[intensity == 0] = np.nan
+
     return timestamps, intensity, ~np.isnan(intensity)
 
 

@@ -3,7 +3,7 @@
 import argparse
 import shutil
 from pathlib import Path
-
+import pickle
 import numpy as np
 import pandas as pd
 
@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SOURCE = ROOT / "data" / "subgraph"
 DEFAULT_NORMAL = ROOT / "data" / "subgraph_normal"
 DEFAULT_GROUNDTRUTH = ROOT / "data" / "subgraph_groundtruth_normal"
+DEFAULT_RANDOMISED = ROOT / "data" / "randomised_normal"
+DEFAULT_RANDOMISED_SINE = ROOT / "data" / "randomised_sine_normal"
 EXPECTED_FILES = ("readings.npz", "edges.csv", "sensors.csv")
 
 
@@ -244,7 +246,31 @@ def fill_groundtruth(normalized, sensor_ids, edges, radius=4):
 
     return filled, stats
 
+def create_randomised_normal(
+    groundtruth_dir=DEFAULT_GROUNDTRUTH,
+    output_dir=ROOT / "data" / "randomised_normal",
+    missing_ratio=0.05,
+    overwrite=True,
+    seed=42,
+):
+    check_output_directories(groundtruth_dir, [output_dir], overwrite)
 
+    # Load groundtruth normal data
+    arrays, _ = load_subgraph(groundtruth_dir)
+    groundtruth = arrays["intensity"]
+
+    # Generate a random mask for 10% missing values
+    np.random.seed(seed)
+    randomised = groundtruth.astype(np.float32, copy=True)
+    mask = np.random.rand(*randomised.shape) < missing_ratio
+    randomised[mask] = np.nan
+
+    # Save to readings.npz along with existing metadata files
+    write_subgraph(groundtruth_dir, output_dir, arrays, randomised)
+    print(f"Created randomised-normal dataset: {output_dir}")
+    print(f"Masked {mask.mean():.2%} of values as NaN.")
+
+    return randomised
 
 def write_subgraph(source_dir, output_dir, arrays, intensity):
     """Write a subgraph copy with a replacement intensity matrix."""
@@ -257,40 +283,74 @@ def write_subgraph(source_dir, output_dir, arrays, intensity):
     for filename in ("edges.csv", "sensors.csv"):
         shutil.copy2(source_dir / filename, output_dir / filename)
 
-def create_datasets(
-    source_dir=DEFAULT_SOURCE,
-    normal_dir=DEFAULT_NORMAL,
-    groundtruth_dir=DEFAULT_GROUNDTRUTH,
-    radius=4,
-    overwrite=False,
-):
-    check_output_directories(
-        source_dir,
-        [normal_dir, groundtruth_dir],
-        overwrite,
-    )
+def create_datasets(source_dir=DEFAULT_SOURCE, normal_dir=DEFAULT_NORMAL, groundtruth_dir=DEFAULT_GROUNDTRUTH, randomised_dir=DEFAULT_RANDOMISED, randomised_sine_dir=DEFAULT_RANDOMISED_SINE, radius=4, missing_ratio=0.05, seed=42, overwrite=True,):
+
+    check_output_directories(source_dir,  [normal_dir, groundtruth_dir, randomised_dir, randomised_sine_dir], overwrite,)
 
     arrays, edges = load_subgraph(source_dir)
     sensor_ids = arrays["sensor_ids"]
     original = arrays["intensity"]
+    timestamps = arrays["timestamps"]
 
     normalized, maxima = normalize_per_sensor(original)
     groundtruth, stats = fill_groundtruth(
         normalized, sensor_ids, edges, radius=radius
     )
 
+    np.random.seed(seed)
+
+    # 1. Standard Uniform Random Masking
+    randomised = groundtruth.astype(np.float32, copy=True)
+    mask = np.random.rand(*randomised.shape) < missing_ratio
+    randomised[mask] = np.nan
+
+    # 2. Sine-Weighted Periodic Random Masking (24-hour period)
+    # Convert timestamps to fractional hour of the day [0.0, 24.0)
+    ts_pd = pd.to_datetime(timestamps)
+    hours = (ts_pd.hour + ts_pd.minute / 60.0 + ts_pd.second / 3600.0).to_numpy()
+
+    # |sin(pi * hour / 24)| has a period of 24 hours
+    sine_weights = np.abs(np.sin(np.pi * hours / 24.0)**10)
+
+    # Scale probabilities so the overall mean missing rate matches missing_ratio
+    probabilities = sine_weights * (missing_ratio / sine_weights.mean())
+    probabilities = np.clip(probabilities, 0.0, 1.0)
+
+    # Broadcast probabilities across all sensor columns: shape [T, N]
+    sine_prob_matrix = np.tile(probabilities[:, None], (1, groundtruth.shape[1]))
+
+    randomised_sine = groundtruth.astype(np.float32, copy=True)
+    mask_sine = np.random.rand(*randomised_sine.shape) < sine_prob_matrix
+    randomised_sine[mask_sine] = np.nan
+
+    # Save all four subgraphs
     write_subgraph(source_dir, normal_dir, arrays, normalized)
     write_subgraph(source_dir, groundtruth_dir, arrays, groundtruth)
+    write_subgraph(source_dir, randomised_dir, arrays, randomised)
+    write_subgraph(source_dir, randomised_sine_dir, arrays, randomised_sine)
 
     print(f"Created normalized dataset: {normal_dir}")
     print(f"Created ground-truth dataset: {groundtruth_dir}")
+    print(f"Created randomised-normal dataset: {randomised_dir}")
+    print(f"Created randomised-sine dataset: {randomised_sine_dir}")
     print(f"Temporal fills: {stats['temporal_fills']:,}")
     print(f"Spatial fills: {stats['spatial_fills']:,}")
     print(f"Unresolved NaNs: {stats['unresolved']:,}")
     print(f"Fallback fills: {stats['fallback_fills']:,}")
-    print(f"Unresolved NaNs: {stats['unresolved']:,}")
+    print(f"Randomly masked NaNs: {mask.sum():,} ({mask.mean():.2%})")
+    print(f"Sine-masked NaNs: {mask_sine.sum():,} ({mask_sine.mean():.2%})")
 
-    return stats
+    return stats, groundtruth, randomised, randomised_sine
+
+
+# Inside create_masked_data.py
+
+def load_datasets():
+    groundtruth = np.load(DEFAULT_GROUNDTRUTH / "readings.npz")["intensity"]
+    randomised = np.load(DEFAULT_RANDOMISED / "readings.npz")["intensity"]
+    randomised_sine = np.load(DEFAULT_RANDOMISED_SINE / "readings.npz")["intensity"]
+
+    return groundtruth, randomised, randomised_sine
 
 def main():
     parser = argparse.ArgumentParser(

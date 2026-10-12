@@ -158,7 +158,7 @@ def nearest_sensor(sensors, lat, lon, candidates):
     return int(d2.idxmin())
 
 
-def select_subgraph(graph, sensors, coverage, n_nodes=500, min_coverage=0.8, centre=MADRID_CENTRE):
+def select_subgraph(graph, sensors, coverage, n_nodes=500, min_coverage=0.8, centre=MADRID_CENTRE, max_nan_run=5000, path=READINGS_PARQUET):
     """
     Grow a connected region of n_nodes well-covered sensors outward from centre.
     Candidates are sensors with at least min_coverage valid training readings.
@@ -166,6 +166,15 @@ def select_subgraph(graph, sensors, coverage, n_nodes=500, min_coverage=0.8, cen
     the region connected.
     """
     candidates = set(coverage.index[coverage >= min_coverage]) & set(graph.nodes)
+
+    # Exclude sensors with a too long consecutive stretch of NaN
+    if max_nan_run is not None:
+        runs = sensor_max_nan_run(sorted(candidates), path)
+        n_before = len(candidates)
+        candidates = set(runs.index[runs <= max_nan_run])
+        print(f"{n_before - len(candidates):,} of {n_before:,} candidates excluded: "
+              f"longest NaN run > {max_nan_run:,} steps")
+
     g = undirected_simple(graph, candidates)
     seed = nearest_sensor(sensors, *centre, max(nx.connected_components(g), key=len))
 
@@ -176,6 +185,11 @@ def select_subgraph(graph, sensors, coverage, n_nodes=500, min_coverage=0.8, cen
         selected.extend(layer[: n_nodes - len(selected)])
         if len(selected) >= n_nodes:
             break
+
+    if len(selected) < n_nodes:
+        print(f"warning: only {len(selected)} sensors available (wanted {n_nodes})")
+    return sorted(selected)
+
     return sorted(selected)
 
 
@@ -272,3 +286,30 @@ def remove_outage_steps(timestamps, intensity, max_bad_fraction=0.5, drop=True):
     cleaned = intensity.copy()
     cleaned[outage] = np.nan
     return timestamps, cleaned, int(outage.sum())
+
+def longest_nan_run(intensity):
+    """Longest run of consecutive NaN time steps."""
+    nan = np.isnan(intensity)
+    run = np.zeros(nan.shape[1], dtype=np.int64)
+    best = np.zeros(nan.shape[1], dtype=np.int64)
+    for row in nan:  # one pass over time; run resets to 0 whenever a value is present
+        run = (run + 1) * row
+        best = np.maximum(best, run)
+    return best #well "worst"
+
+
+def sensor_max_nan_run(sensor_ids, path=READINGS_PARQUET, chunk_size=1000):
+    """Longest consecutive NaN run (in 15-min steps) per sensor over the whole 2024 grid.
+
+    Uses the same NaN definition as the final data: invalid readings plus removed spikes.
+    Sensors are processed in chunks to limit memory use.
+    """
+    sensor_ids = np.asarray(sensor_ids)
+    if len(sensor_ids) == 0:
+        return pd.Series([], dtype="int64", name="max_nan_run")
+    runs = []
+    for i in range(0, len(sensor_ids), chunk_size):
+        timestamps, intensity, _ = build_grid(sensor_ids[i:i + chunk_size], path)
+        intensity, _ = remove_spikes(timestamps, intensity)
+        runs.append(longest_nan_run(intensity))
+    return pd.Series(np.concatenate(runs), index=sensor_ids, name="max_nan_run")

@@ -12,6 +12,7 @@ def main():
 	parser.add_argument("--min-coverage", type=float, default=0.8, help="minimum fraction of valid training readings per sensor")
 	parser.add_argument("--overwrite", action="store_true", help="re-convert the raw CSV")
 	parser.add_argument("--max-bad-fraction", type=float, default=0.5, help="discard time steps where more than this fraction of sensors are NaN or 0")
+	parser.add_argument("--max-nan-run", type=int, default=500, help="exclude sensors with more than this many consecutive NaN time steps")
 	args = parser.parse_args()
 
 	# Convert the raw CSV to Parquet for faster reads/memory efficiency in later steps
@@ -25,7 +26,8 @@ def main():
 		f"{(coverage >= args.min_coverage).sum():,}")
 
 	# Create a subgraph of 500 sensors with good training coverage and save it
-	subgraph = preprocess.select_subgraph(graph, sensors, coverage, args.n_nodes, args.min_coverage)
+	subgraph = preprocess.select_subgraph(graph, sensors, coverage, args.n_nodes, args.min_coverage, max_nan_run=args.max_nan_run)
+
 	timestamps, intensity, _ = preprocess.build_grid(subgraph)
 	intensity, n_spikes = preprocess.remove_spikes(timestamps, intensity) # Remove heavy outliers
 

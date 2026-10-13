@@ -94,7 +94,7 @@ def save_annotated(img, timestamps, out_path, title=None, dpi=150, figsize=(14, 
     step = (timestamps[1] - timestamps[0]) if len(timestamps) > 1 else pd.Timedelta("15min")
     t1 = date2num(timestamps[0] + step * len(timestamps))
 
-    fig = Figure(figsize=figsize)  # object API: no pyplot, no global backend state
+    fig = Figure(figsize=figsize)
     ax = fig.subplots()
     ax.imshow(img, cmap="gray", vmin=0, vmax=255, aspect="auto",
               interpolation="nearest", extent=(t0, t1, img.shape[0], 0))

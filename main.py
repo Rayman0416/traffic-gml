@@ -21,13 +21,13 @@ def main():
 	args = parser.parse_args()
 
 
-	WantToDoPreProcess = True #There must be a better way than this??
+	WantToDoPreProcess = False #There must be a better way than this??
 	WantToDoMasks = True
 
 
 	if WantToDoPreProcess:
 		# Convert the raw CSV to Parquet for faster reads/memory efficiency in later steps
-		preprocess.convert_readings_to_parquet(overwrite=args.overwrite)
+		preprocess.convert_readings_to_parquet()
 		sensors = preprocess.load_sensors()
 		graph = preprocess.load_route_graph()
 
@@ -67,7 +67,7 @@ def main():
 		print(f"saved to {preprocess.SUBGRAPH_DIR}")
 
 		plot_dir = Path(args.plot_dir)
-		Visualize.make_picture(intensity, timestamps, plot_dir / "grid_cleaned.png", sensor_ids=subgraph, time_bin=1,y_scale=1)
+		Visualize.make_picture(intensity, timestamps, plot_dir / "grid_cleaned.png", sensor_ids=subgraph, time_bin=1,y_scale=2)
 
 		n_comp = Visualize.draw_graph(sensors.loc[subgraph], edges, plot_dir / "graph.png")
 		print(f"pictures saved to {plot_dir}, graph has {n_comp} connected component(s)")
@@ -79,17 +79,17 @@ def main():
 
 	if WantToDoMasks:
 		print("Creating datasets...")
-		stats, groundtruth, randomised, randomised_sine = create_masked_data.create_datasets(overwrite=True)
+		stats, groundtruth, randomised, randomised_sine = create_masked_data.create_datasets(missing_ratio=0.05)
 
 		plot_dir = Path(args.plot_dir)
 		# Plot Groundtruth Normal
-		Visualize.make_picture(groundtruth, timestamps, plot_dir / "grid_groundtruth_normal.png", sensor_ids=subgraph, time_bin=1, y_scale=1,)
+		Visualize.make_picture(groundtruth, timestamps, plot_dir / "grid_groundtruth_normal.png", sensor_ids=subgraph, time_bin=1, y_scale=2,)
 
 		# Plot Randomised Normal
-		Visualize.make_picture(randomised, timestamps, plot_dir / "grid_randomised_normal.png", sensor_ids=subgraph, time_bin=1, y_scale=1,)
+		Visualize.make_picture(randomised, timestamps, plot_dir / "grid_randomised_normal.png", sensor_ids=subgraph, time_bin=1, y_scale=2,)
 
 		# Sine randomised
-		Visualize.make_picture(randomised_sine, timestamps, plot_dir / "grid_randomised_sine.png", sensor_ids=subgraph, time_bin=1, y_scale=1,)
+		Visualize.make_picture(randomised_sine, timestamps, plot_dir / "grid_randomised_sine.png", sensor_ids=subgraph, time_bin=1, y_scale=2,)
 
 	else:
 		print("Loading pre-existing masked datasets from disk...")

@@ -1,9 +1,6 @@
-"""Create per-sensor-normalized and ground-truth-filled traffic subgraphs."""
-
 import argparse
 import shutil
 from pathlib import Path
-import pickle
 import numpy as np
 import pandas as pd
 
@@ -15,24 +12,6 @@ DEFAULT_GROUNDTRUTH = ROOT / "data" / "subgraph_groundtruth_normal"
 DEFAULT_RANDOMISED = ROOT / "data" / "randomised_normal"
 DEFAULT_RANDOMISED_SINE = ROOT / "data" / "randomised_sine_normal"
 EXPECTED_FILES = ("readings.npz", "edges.csv", "sensors.csv")
-
-
-def check_output_directories(source_dir, output_dirs, overwrite):
-    source = source_dir.resolve()
-    resolved_outputs = [p.resolve() for p in output_dirs]
-
-    if any(p == source for p in resolved_outputs):
-        raise ValueError("An output directory cannot be the source directory.")
-    if len(set(resolved_outputs)) != len(resolved_outputs):
-        raise ValueError("Output directories must be different.")
-
-    for out_dir in output_dirs:
-        if out_dir.exists() and not overwrite:
-            raise FileExistsError(
-                f"Output directory already exists: {out_dir}\n"
-                "Choose another output path or rerun with --overwrite."
-            )
-
 
 def load_subgraph(source_dir):
     """Load the matrix and its associated graph/metadata files."""
@@ -114,7 +93,7 @@ def normalize_per_sensor(intensity):
     return normalized, maxima
 
 
-def build_neighbour_columns(sensor_ids, edges):
+def build_neighbour_columns(sensor_ids, edges): #this is just to do spatial fills. I think spacial fills is better than temporal? Maybe?
     """Build undirected neighbour lists from the directed route-edge table."""
     column_by_id = {sensor_id: i for i, sensor_id in enumerate(sensor_ids)}
     neighbours = [set() for _ in sensor_ids]
@@ -136,15 +115,18 @@ def build_neighbour_columns(sensor_ids, edges):
 
 
 
-def fill_groundtruth(normalized, sensor_ids, edges, radius=4):
+def fill_groundtruth(normalized, sensor_ids, edges, steps_per_day=96, max_days=3):
     """Iteratively fill NaNs using temporal lookup and spatial neighbour means.
+
+    Temporal lookup now checks the same time of day at +/- 1..max_days days
+    (steps_per_day = 96 for 15-minute timesteps), instead of nearby timesteps.
+    The closest day wins; on a tie between past and future, the past day is used.
 
     Each iteration uses a snapshot of the previous iteration, so newly filled
     values only propagate during subsequent iterations.
 
     If no more progress is possible, any remaining NaNs are filled using the
-    global mean of available normalized readings. If the entire dataset is
-    NaN, use 0.0 as the final fallback.
+    global mean of available normalized readings.
 
     Returns the filled matrix and fill statistics.
     """
@@ -152,9 +134,10 @@ def fill_groundtruth(normalized, sensor_ids, edges, radius=4):
     n_times, n_sensors = filled.shape
     neighbours = build_neighbour_columns(sensor_ids, edges)
 
+    day_offsets = [d * steps_per_day for d in range(1, max_days + 1)]
+
     temporal_fills = 0
     spatial_fills = 0
-    fallback_fills = 0
     iterations = 0
 
     while np.isnan(filled).any():
@@ -171,38 +154,40 @@ def fill_groundtruth(normalized, sensor_ids, edges, radius=4):
             )
 
             for t in missing_times:
-                start = max(0, t - radius)
-                stop = min(n_times, t + radius + 1)
+                # Rule 1: same time of day, 1..max_days days away
+                # (checking the past first, then the future, nearest day first).
+                temporal_value = None
 
-                # Rule 1: nearest valid reading from the same sensor.
-                window = previous[start:stop, sensor_col]
-                valid_offsets = np.flatnonzero(~np.isnan(window))
+                for offset in day_offsets:
+                    for candidate_t in (t - offset, t + offset):
+                        if 0 <= candidate_t < n_times:
+                            candidate = previous[candidate_t, sensor_col]
+                            if not np.isnan(candidate):
+                                temporal_value = candidate
+                                break
+                    if temporal_value is not None:
+                        break
 
-                if valid_offsets.size:
-                    valid_times = start + valid_offsets
-                    nearest_t = valid_times[
-                        np.argmin(np.abs(valid_times - t))
-                    ]
-                    updated[t, sensor_col] = previous[
-                        nearest_t, sensor_col
-                    ]
+                if temporal_value is not None:
+                    updated[t, sensor_col] = temporal_value
                     temporal_fills += 1
                     progress += 1
                     continue
 
-                # Rule 2: mean of valid graph neighbours at this timestamp.
-                neighbour_cols = neighbours[sensor_col]
+                if iterations > 2:
+                    # Rule 2: mean of valid graph neighbours at this timestamp.
+                    neighbour_cols = neighbours[sensor_col]
 
-                if neighbour_cols:
-                    values = previous[t, neighbour_cols]
-                    values = values[~np.isnan(values)]
-                else:
-                    values = np.empty(0, dtype=np.float32)
+                    if neighbour_cols:
+                        values = previous[t, neighbour_cols]
+                        values = values[~np.isnan(values)]
+                    else:
+                        values = np.empty(0, dtype=np.float32)
 
-                if values.size:
-                    updated[t, sensor_col] = np.mean(values)
-                    spatial_fills += 1
-                    progress += 1
+                    if values.size:
+                        updated[t, sensor_col] = np.mean(values)
+                        spatial_fills += 1
+                        progress += 1
 
         filled = updated
 
@@ -211,34 +196,13 @@ def fill_groundtruth(normalized, sensor_ids, edges, radius=4):
             f"{np.isnan(filled).sum():,} NaNs remaining"
         )
 
-        # If nothing could be filled, another iteration cannot help without
-        # introducing a fallback value.
+        # If this happens we have failed with the dataset
         if progress == 0:
-            break
-
-    # Final fallback: guarantee that no NaNs remain.
-    remaining = np.isnan(filled)
-    fallback_fills = int(remaining.sum())
-
-    if fallback_fills:
-        valid_values = filled[~np.isnan(filled)]
-
-        if valid_values.size:
-            fallback_value = float(np.mean(valid_values))
-        else:
-            fallback_value = 0.0
-
-        filled[remaining] = fallback_value
-
-        print(
-            f"Fallback: filled {fallback_fills:,} remaining NaNs "
-            f"with {fallback_value:.6f}"
-        )
+            exit(400)
 
     stats = {
         "temporal_fills": temporal_fills,
         "spatial_fills": spatial_fills,
-        "fallback_fills": fallback_fills,
         "unresolved": int(np.isnan(filled).sum()),
         "remaining_nan": int(np.isnan(filled).sum()),
         "iterations": iterations,
@@ -250,16 +214,14 @@ def create_randomised_normal(
     groundtruth_dir=DEFAULT_GROUNDTRUTH,
     output_dir=ROOT / "data" / "randomised_normal",
     missing_ratio=0.05,
-    overwrite=True,
     seed=42,
 ):
-    check_output_directories(groundtruth_dir, [output_dir], overwrite)
 
     # Load groundtruth normal data
     arrays, _ = load_subgraph(groundtruth_dir)
     groundtruth = arrays["intensity"]
 
-    # Generate a random mask for 10% missing values
+    # Generate a random mask for X% missing values
     np.random.seed(seed)
     randomised = groundtruth.astype(np.float32, copy=True)
     mask = np.random.rand(*randomised.shape) < missing_ratio
@@ -283,9 +245,7 @@ def write_subgraph(source_dir, output_dir, arrays, intensity):
     for filename in ("edges.csv", "sensors.csv"):
         shutil.copy2(source_dir / filename, output_dir / filename)
 
-def create_datasets(source_dir=DEFAULT_SOURCE, normal_dir=DEFAULT_NORMAL, groundtruth_dir=DEFAULT_GROUNDTRUTH, randomised_dir=DEFAULT_RANDOMISED, randomised_sine_dir=DEFAULT_RANDOMISED_SINE, radius=4, missing_ratio=0.05, seed=42, overwrite=True,):
-
-    check_output_directories(source_dir,  [normal_dir, groundtruth_dir, randomised_dir, randomised_sine_dir], overwrite,)
+def create_datasets(source_dir=DEFAULT_SOURCE, normal_dir=DEFAULT_NORMAL, groundtruth_dir=DEFAULT_GROUNDTRUTH, randomised_dir=DEFAULT_RANDOMISED, randomised_sine_dir=DEFAULT_RANDOMISED_SINE, missing_ratio=0.05, seed=42,):
 
     arrays, edges = load_subgraph(source_dir)
     sensor_ids = arrays["sensor_ids"]
@@ -293,9 +253,7 @@ def create_datasets(source_dir=DEFAULT_SOURCE, normal_dir=DEFAULT_NORMAL, ground
     timestamps = arrays["timestamps"]
 
     normalized, maxima = normalize_per_sensor(original)
-    groundtruth, stats = fill_groundtruth(
-        normalized, sensor_ids, edges, radius=radius
-    )
+    groundtruth, stats = fill_groundtruth(normalized, sensor_ids, edges)
 
     np.random.seed(seed)
 
@@ -336,14 +294,11 @@ def create_datasets(source_dir=DEFAULT_SOURCE, normal_dir=DEFAULT_NORMAL, ground
     print(f"Temporal fills: {stats['temporal_fills']:,}")
     print(f"Spatial fills: {stats['spatial_fills']:,}")
     print(f"Unresolved NaNs: {stats['unresolved']:,}")
-    print(f"Fallback fills: {stats['fallback_fills']:,}")
     print(f"Randomly masked NaNs: {mask.sum():,} ({mask.mean():.2%})")
     print(f"Sine-masked NaNs: {mask_sine.sum():,} ({mask_sine.mean():.2%})")
 
     return stats, groundtruth, randomised, randomised_sine
 
-
-# Inside create_masked_data.py
 
 def load_datasets():
     groundtruth = np.load(DEFAULT_GROUNDTRUTH / "readings.npz")["intensity"]
@@ -360,7 +315,6 @@ def main():
     parser.add_argument("--normal-dir", type=Path, default=DEFAULT_NORMAL)
     parser.add_argument("--groundtruth-dir", type=Path, default=DEFAULT_GROUNDTRUTH)
     parser.add_argument("--radius", type=int, default=4)
-    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     if args.radius < 0:
@@ -371,7 +325,6 @@ def main():
         normal_dir=args.normal_dir,
         groundtruth_dir=args.groundtruth_dir,
         radius=args.radius,
-        overwrite=args.overwrite,
     )
 
 

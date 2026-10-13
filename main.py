@@ -21,7 +21,7 @@ def main():
 	args = parser.parse_args()
 
 
-	WantToDoPreProcess = False #There must be a better way than this??
+	WantToDoPreProcess = True #There must be a better way than this??
 	WantToDoMasks = True
 
 

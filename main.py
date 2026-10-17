@@ -27,8 +27,8 @@ def main():
 	
 	for ch in features.SENSOR_CHANNELS:
 		v, m = f[ch], f[f"{ch}_mask"]
-		print(f"  {ch:9s} {v.shape} {v.dtype}, genuine {m.mean():.2%}, scaled mean {v[m].mean():+.3f}, std {v[m].std():.3f}")
-	print(f"  time features {f['time_features'].shape}: {', '.join(f['time_feature_names'])}")
+		print(f"{ch:9s} {v.shape} {v.dtype}, genuine {m.mean():.2%}, scaled mean {v[m].mean():+.3f}, std {v[m].std():.3f}")
+	print(f"time features {f['time_features'].shape}: {', '.join(f['time_feature_names'])}")
 
 	# Gather the inputs of a few training windows, as a model would read them.
 	win = windows.load(out_dir)
@@ -36,13 +36,13 @@ def main():
 	x = features.window_features(f, origins)
 	print(f"\nbatch of {len(origins)} training windows")
 	for k in ("intensity", "intensity_mask", "occupancy", "occupancy_mask", "time_features", "history_index"):
-		print(f"  {k:15s} {x[k].shape}")
+		print(f"{k:15s} {x[k].shape}")
 
 	np.set_printoptions(precision=3, suppress=True)
 	print(f"\nfirst window, origin {f['timestamps'][origins[0]]}, first 5 sensors {x['sensor_ids'][:5]}:")
-	print(f"  intensity [L, 5]:\n{x['intensity'][0, :, :5]}")
-	print(f"  intensity_mask [L, 5]:\n{x['intensity_mask'][0, :, :5]}")
-	print(f"  time_features: {x['time_features'][0]}")
+	print(f"intensity [L, 5]:\n{x['intensity'][0, :, :5]}")
+	print(f"intensity_mask [L, 5]:\n{x['intensity_mask'][0, :, :5]}")
+	print(f"time_features: {x['time_features'][0]}")
 
 if __name__ == "__main__":
 	main()

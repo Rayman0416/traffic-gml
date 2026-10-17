@@ -1,99 +1,48 @@
+# Run the preprocessing pipeline, then load and print the model input features.
+
+# python main.py                       # run the full pipeline, then show the features
+# python main.py --skip-preprocess     # only load and show the existing features
+# python main.py --from windows        # any other flag is passed to preprocess.run
+
 import argparse
-import networkx as nx
 import numpy as np
-import preprocess
-from pathlib import Path
-import Visualize
-import create_masked_data
+from preprocess import features, windows
+from preprocess import run as pipeline
+
 
 def main():
-	# Parse CLI arguments
-	parser = argparse.ArgumentParser(description=__doc__)
-	parser.add_argument("--n-nodes", type=int, default=500, help="number of sensors in the subgraph region")
-	parser.add_argument("--min-coverage", type=float, default=0.8, help="minimum fraction of valid training readings per sensor")
-	parser.add_argument("--overwrite", action="store_true", help="re-convert the raw CSV")
-	parser.add_argument("--max-bad-fraction", type=float, default=0.5, help="discard time steps where more than this fraction of sensors are NaN or 0")
-	parser.add_argument("--max-nan-run", type=int, default=500, help="exclude sensors with more than this many consecutive NaN time steps")
-	parser.add_argument("--plot-dir", default="figures", help="where to save the pictures")
+	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument("--skip-preprocess", action="store_true", help="load the existing features without running the pipeline")
+	args, pipeline_args = parser.parse_known_args()
 
-	#experimental turn all zeros to NaN to remove them. Not sure if this is good. I think 0 are no good values
-	parser.add_argument("--zeros-to-nan", action=argparse.BooleanOptionalAction, default=True, help="convert zero values to NaN during grid creation")
-	args = parser.parse_args()
+	if not args.skip_preprocess:
+		pipeline.main(pipeline_args)
 
+	out_dir = pipeline.parse_args(pipeline_args).out_dir
+	f = features.load(out_dir)
+	T, N = f["intensity"].shape
 
-	WantToDoPreProcess = True #There must be a better way than this??
-	WantToDoMasks = True
+	print(f"\nfeatures from {out_dir / 'features.npz'}")
+	print(f"  {T:,} timesteps ({f['timestamps'][0]} .. {f['timestamps'][-1]}) x {N:,} sensors, history length {f['history_length']}")
+	
+	for ch in features.SENSOR_CHANNELS:
+		v, m = f[ch], f[f"{ch}_mask"]
+		print(f"  {ch:9s} {v.shape} {v.dtype}, genuine {m.mean():.2%}, scaled mean {v[m].mean():+.3f}, std {v[m].std():.3f}")
+	print(f"  time features {f['time_features'].shape}: {', '.join(f['time_feature_names'])}")
 
+	# Gather the inputs of a few training windows, as a model would read them.
+	win = windows.load(out_dir)
+	origins = win.loc[win["split"] == "train", "origin_index"].to_numpy()[:4]
+	x = features.window_features(f, origins)
+	print(f"\nbatch of {len(origins)} training windows")
+	for k in ("intensity", "intensity_mask", "occupancy", "occupancy_mask", "time_features", "history_index"):
+		print(f"  {k:15s} {x[k].shape}")
 
-	if WantToDoPreProcess:
-		# Convert the raw CSV to Parquet for faster reads/memory efficiency in later steps
-		preprocess.convert_readings_to_parquet()
-		sensors = preprocess.load_sensors()
-		graph = preprocess.load_route_graph()
-
-		coverage = preprocess.sensor_coverage()
-		print(f"sensors with readings: {len(coverage):,}; "
-			f"with >= {args.min_coverage:.0%} valid training readings: "
-			f"{(coverage >= args.min_coverage).sum():,}")
-
-		# Create a subgraph of 500 sensors with good training coverage and save it
-		subgraph = preprocess.select_subgraph(graph, sensors, coverage, args.n_nodes, args.min_coverage, max_nan_run=args.max_nan_run)
-
-		timestamps, intensity, _ = preprocess.build_grid(subgraph, zeros_to_nan=args.zeros_to_nan)
-		intensity, n_spikes = preprocess.remove_spikes(timestamps, intensity) # Remove heavy outliers
-		print(f"removed {n_spikes} spike readings (> 3x sensor's training 99th percentile)")
-
-		n_before = len(timestamps)
-		timestamps, intensity, n_outage = preprocess.remove_outage_steps(timestamps, intensity, args.max_bad_fraction)
-		print(f"removed {n_outage:,} of {n_before:,} time steps "
-			  f"(> {args.max_bad_fraction:.0%} of sensors NaN or 0)")
-
-		valid = ~np.isnan(intensity)
-
-		edges = preprocess.subgraph_edges(graph, subgraph)
-		preprocess.save_subgraph(subgraph, timestamps, intensity, edges, sensors)
-
-		# Info about the subgraph region
-		und = preprocess.undirected_simple(graph, subgraph)
-		train = timestamps < preprocess.TRAIN_END
-		test = timestamps >= preprocess.VAL_END
-		print(f"subgraph: {len(subgraph)} sensors, {len(edges):,} directed edges, "
-			f"{und.number_of_edges():,} undirected edges, connected={nx.is_connected(und)}")
-		print(f"grid: {intensity.shape[0]:,} time steps x {intensity.shape[1]} sensors; "
-			f"valid readings: all {valid.mean():.1%}, train {valid[train].mean():.1%}, "
-			f"test {valid[test].mean():.1%}")
-		print(f"intensity (veh/h) median {np.nanmedian(intensity):.0f}, "
-			f"99th pct {np.nanpercentile(intensity, 99):.0f}, max {np.nanmax(intensity):.0f}")
-		print(f"saved to {preprocess.SUBGRAPH_DIR}")
-
-		plot_dir = Path(args.plot_dir)
-		Visualize.make_picture(intensity, timestamps, plot_dir / "grid_cleaned.png", sensor_ids=subgraph, time_bin=1,y_scale=2)
-
-		n_comp = Visualize.draw_graph(sensors.loc[subgraph], edges, plot_dir / "graph.png")
-		print(f"pictures saved to {plot_dir}, graph has {n_comp} connected component(s)")
-
-	else:
-		print("Skipping preprocessing. Loading pre-processed subgraph...")
-		subgraph, timestamps, intensity, edges, sensors = preprocess.load_subgraph()
-
-
-	if WantToDoMasks:
-		print("Creating datasets...")
-		stats, groundtruth, randomised, randomised_sine = create_masked_data.create_datasets(missing_ratio=0.05)
-
-		plot_dir = Path(args.plot_dir)
-		# Plot Groundtruth Normal
-		Visualize.make_picture(groundtruth, timestamps, plot_dir / "grid_groundtruth_normal.png", sensor_ids=subgraph, time_bin=1, y_scale=2,)
-
-		# Plot Randomised Normal
-		Visualize.make_picture(randomised, timestamps, plot_dir / "grid_randomised_normal.png", sensor_ids=subgraph, time_bin=1, y_scale=2,)
-
-		# Sine randomised
-		Visualize.make_picture(randomised_sine, timestamps, plot_dir / "grid_randomised_sine.png", sensor_ids=subgraph, time_bin=1, y_scale=2,)
-
-	else:
-		print("Loading pre-existing masked datasets from disk...")
-		groundtruth, randomised, randomised_sine = create_masked_data.load_datasets()
+	np.set_printoptions(precision=3, suppress=True)
+	print(f"\nfirst window, origin {f['timestamps'][origins[0]]}, first 5 sensors {x['sensor_ids'][:5]}:")
+	print(f"  intensity [L, 5]:\n{x['intensity'][0, :, :5]}")
+	print(f"  intensity_mask [L, 5]:\n{x['intensity_mask'][0, :, :5]}")
+	print(f"  time_features: {x['time_features'][0]}")
 
 if __name__ == "__main__":
-    main()
+	main()

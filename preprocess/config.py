@@ -81,10 +81,11 @@ MAX_TRAIN_GAP_STEPS = 500     # longest run of consecutive training gaps allowed
 REQUIRE_GRAPH_MEMBERSHIP = False  # graph isolation alone must not exclude a sensor
 REQUIRE_DISTRICT = True       # district partitioning needs a district label
 
-# "region" or "all" where region builds from a connected subgraph around the centre 
-# based on the N_NODES
+# "all" or "districts". all keeps every eligible sensor in the network; districts
+# takes every eligible sensor in a connected block of N_DISTRICTS whole districts
+# grown from the centre
 SELECTION = "all"
-N_NODES = 500 # region size when SELECTION == "region" only
+N_DISTRICTS = 6 # districts to select when SELECTION == "districts" only
 
 # A district needs enough sensors to be worth modelling as a graph at all
 MIN_DISTRICT_SENSORS = 10
@@ -236,7 +237,7 @@ RECORDED_SETTINGS = (
     # forecasting task
     "INPUT_LENGTH", "HORIZONS",
     # sensor eligibility
-    "SELECTION", "N_NODES", "MIN_TRAIN_COVERAGE", "MAX_TRAIN_GAP_STEPS",
+    "SELECTION", "N_DISTRICTS", "MIN_TRAIN_COVERAGE", "MAX_TRAIN_GAP_STEPS",
     "REQUIRE_DISTRICT", "REQUIRE_GRAPH_MEMBERSHIP", "MIN_DISTRICT_SENSORS",
     # cleaning
     "REJECT_NEGATIVE", "HARD_CAP_VEH_PER_HOUR",

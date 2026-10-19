@@ -115,35 +115,48 @@ def _nearest(sensors: pd.DataFrame, lat: float, lon: float, candidates) -> int:
     return int(d2.idxmin())
 
 
-def _grow_region(graph, sensors: pd.DataFrame, eligible: set[int],
-                 n_nodes: int, centre=C.MADRID_CENTRE) -> list[int]:
+def _grow_districts(graph, sensors: pd.DataFrame, eligible: set[int],
+                    n_districts: int, centre=C.MADRID_CENTRE) -> list[int]:
     """
-    Grow a connected region of sensors from the centre, returning up to ``n_nodes``.
-    The region is grown in breadth-first order, with ties broken by distance to the centre.
+    Grow a connected block of ``n_districts`` districts from the centre and return
+    all eligible sensors in them. Two districts are connected when a sensor edge
+    in the route graph runs between them.
     """
     g = _undirected_simple(graph, eligible)
-    if g.number_of_nodes() == 0:
-        return []
-    biggest = max(nx.connected_components(g), key=len)
-    seed = _nearest(sensors, *centre, biggest)
+    district = sensors["district"]
 
-    def dist(n):
-        return float(np.hypot(sensors.at[seed, "utm_x"] - sensors.at[n, "utm_x"],
-                              sensors.at[seed, "utm_y"] - sensors.at[n, "utm_y"]))
+    # link two districts when a sensor edge crosses between them
+    neighbours: dict[int, set[int]] = {}
+    for u, v in g.edges():
+        du, dv = district.get(u), district.get(v)
+        if pd.notna(du) and pd.notna(dv) and du != dv:
+            neighbours.setdefault(int(du), set()).add(int(dv))
+            neighbours.setdefault(int(dv), set()).add(int(du))
 
-    selected: list[int] = []
-    for layer in nx.bfs_layers(g, seed):
-        for n in sorted(layer, key=dist):
-            selected.append(int(n))
-            if len(selected) >= n_nodes:
-                return sorted(selected)
-    return sorted(selected)
+    # start from the district holding the eligible sensor nearest the centre
+    seed = int(district[_nearest(sensors, *centre, eligible)])
+
+    # breadth-first over districts, ties broken by district number
+    picked = [seed]
+    frontier = [seed]
+    while frontier and len(picked) < n_districts:
+        nxt = []
+        for d in frontier:
+            for nb in sorted(neighbours.get(d, ())):
+                if nb not in picked:
+                    picked.append(nb)
+                    nxt.append(nb)
+        frontier = nxt
+    keep = set(picked[:n_districts])
+
+    return sorted(s for s in eligible
+                  if pd.notna(district.get(s)) and int(district[s]) in keep)
 
 
 def build(path=C.READINGS_PARQUET, out_dir=C.OUT_DIR,
           min_coverage=C.MIN_TRAIN_COVERAGE,
           max_gap=C.MAX_TRAIN_GAP_STEPS,
-          selection=C.SELECTION, n_nodes=C.N_NODES,
+          selection=C.SELECTION, n_districts=C.N_DISTRICTS,
           verbose=True) -> tuple[pd.DataFrame, dict]:
     """Choose the sensors and save the selection table."""
 
@@ -155,7 +168,7 @@ def build(path=C.READINGS_PARQUET, out_dir=C.OUT_DIR,
     df = pd.DataFrame(index=sensors.index.copy())
     df.index.name = "sensor_id"
     for col in ("latitude", "longitude", "utm_x", "utm_y", "district", "element_type", "lanes", "max_speed", "max_capacity", "has_data"):
-        df[col] = sensors[col]
+        df[col] = sensors[col] if col in sensors.columns else np.nan
 
     # get the graph membership and degree, and whether the sensor is in the dataset at all
     gdeg = dict(_undirected_simple(graph).degree())
@@ -212,8 +225,8 @@ def build(path=C.READINGS_PARQUET, out_dir=C.OUT_DIR,
         chosen = [s_ for s_ in chosen
                   if pd.notna(district_of.get(s_))
                   and int(district_of[s_]) not in banned]
-    elif selection == "region":
-        raise ValueError("implement region selection later")
+    elif selection == "districts":
+        chosen = _grow_districts(graph, sensors, eligible, n_districts)
     else:
         raise ValueError(f"unknown selection: {selection!r}")
 

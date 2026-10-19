@@ -44,8 +44,7 @@ def check_columns(path=C.READINGS_PARQUET) -> dict:
     for lo, hi in month_slices():
         filter = ((pc.field("entry_date") >= _ts(lo)) & (pc.field("entry_date") < _ts(hi)))
         table = dataset.to_table(
-            columns=["sensor_id", "traffic_intensity", "read_error",
-                     "is_interpolated", "original_traffic_intensity"],
+            columns=["sensor_id", "traffic_intensity", "read_error", "is_interpolated"],
             filter=filter,
         )
         n_rows += table.num_rows
@@ -231,10 +230,10 @@ def check_sensor_sets(reading_sensor_ids: list[int]) -> dict:
             f"{static_cols} cannot change within the period; any real "
             "relocation would be invisible in this source"
         ),
-        "has_data_flag": sensors["has_data"].value_counts().to_dict(),
+        "has_data_flag": (sensors["has_data"].value_counts().to_dict() if "has_data" in sensors.columns else None),
         "district_missing": int(sensors["district"].isna().sum()),
         "lanes_missing": int(sensors["lanes"].isna().sum()),
-        "max_capacity_missing": int(sensors["max_capacity"].isna().sum()),
+        "max_capacity_missing": (int(sensors["max_capacity"].isna().sum()) if "max_capacity" in sensors.columns else None),
     }
 
 

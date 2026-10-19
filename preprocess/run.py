@@ -3,7 +3,7 @@
 # python -m preprocess.run # runs all stages in order
 # python -m preprocess.run --stages audit # runs only the audit stage
 # python -m preprocess.run --from observed # resume from a stage onwards
-# python -m preprocess.run --n-nodes 200 --min-coverage 0.9
+# python -m preprocess.run --selection districts --n-districts 6 --min-coverage 0.9
 # python -m preprocess.run --from windows --history-length 8
 
 # Stages run in dependency order:
@@ -46,7 +46,7 @@ def _stage_select(args):
     """
     sensor_selection.build(out_dir=args.out_dir, min_coverage=args.min_coverage,
                            max_gap=args.max_nan_run, selection=args.selection,
-                           n_nodes=args.n_nodes)
+                           n_districts=args.n_districts)
 
 
 def _stage_graphs(args):
@@ -133,14 +133,15 @@ def parse_args(argv=None):
                    default=C.OUT_DIR, help="output directory")
     p.add_argument("--overwrite", action="store_true",
                    help="re-convert the raw CSV even if the Parquet exists")
-    p.add_argument("--n-nodes", type=int, default=C.N_NODES,
-                   help="sensors in the selected region")
+    p.add_argument("--n-districts", type=int, default=C.N_DISTRICTS,
+                   help="districts to select with --selection districts")
     p.add_argument("--min-coverage", type=float, default=C.MIN_TRAIN_COVERAGE,
                    help="minimum fraction of genuine training observations")
     p.add_argument("--max-nan-run", type=int, default=C.MAX_TRAIN_GAP_STEPS,
                    help="maximum consecutive training gap, in 15-min steps")
-    p.add_argument("--selection", choices=("region", "all"), default=C.SELECTION,
-                   help="connected region around the centre, or all eligible")
+    p.add_argument("--selection", choices=("all", "districts"), default=C.SELECTION,
+                   help="the whole network, or a connected block of whole "
+                        "districts around the centre")
     p.add_argument("--history-length", type=int, default=C.INPUT_LENGTH,
                    help="input history in 15-min steps, including the origin "
                         "(windows and features stages)")
@@ -163,7 +164,9 @@ def main(argv=None) -> int:
     np.random.seed(C.RANDOM_SEED)
 
     # CLI overrides of recorded settings, so source.json reflects this run.
-    overrides = {"INPUT_LENGTH": args.history_length}
+    overrides = {"INPUT_LENGTH": args.history_length,
+                 "SELECTION": args.selection,
+                 "N_DISTRICTS": args.n_districts}
     C.write_json(C.source({"stages_requested": stages}, overrides),
                  args.out_dir / "source.json")
 

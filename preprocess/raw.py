@@ -16,9 +16,7 @@ from . import config as C
 
 # The raw CSV header is:
 #   sensor_id, entry_date, traffic_intensity, sensor_occupancy, avg_speed,
-#   read_error, original_traffic_intensity, is_interpolated
-#
-# original_traffic_intensity is empty everywhere so not sure what it is for.
+#   read_error, is_interpolated
 #
 # traffic_intensity is vehicles per hour
 #
@@ -34,7 +32,6 @@ READINGS_SCHEMA = pa.schema([
     ("sensor_occupancy", pa.float32()),
     ("avg_speed", pa.float32()),
     ("read_error", pa.string()),
-    ("original_traffic_intensity", pa.float32()),
     ("is_interpolated", pa.string()),
 ])
 

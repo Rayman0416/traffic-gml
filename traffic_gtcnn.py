@@ -21,11 +21,11 @@ import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
 DISTRICT = 1              # only district 1, for faster training
-WINDOW = 2                # input window in timesteps (features.npz history_length)
+WINDOW = 3                # input window in timesteps (features.npz history_length)
 HORIZON_COL = "target_index_h2"   # 2 steps ahead = 30 minutes
 N_TAPS = 2                # graph filter order
 N_FEAT = 8                # hidden features per layer
-BATCH_SIZE = int(16384*1)
+BATCH_SIZE = int(16384*2)
 EPOCHS = 50
 LR = 2e-3
 
@@ -250,7 +250,7 @@ def main():
     print(f"  GTCNN       {rmse:.2f} vehicles/hour")
     print(f"  persistence {rmse_persistence:.2f} vehicles/hour (predict current intensity)")
 
-    # --------------------- figures: 10 sensors, prediction vs truth over the test set
+    # ----------------- figures: 10 sensors, prediction vs truth, last week of the test set
     z = np.load(DATA_DIR / "features.npz")
     t_test = z["timestamps"][targets_test.cpu().numpy()]     # target time of each window
     sid_all = z["sensor_ids"]
@@ -259,6 +259,9 @@ def main():
     pred_np = pred.cpu().numpy()[order]
     y_np = y_phys.cpu().numpy()[order]
     y_np[mask.cpu().numpy()[order] == 0] = np.nan  # gap the truth line where target is missing
+
+    week = t_test >= t_test[-1] - np.timedelta64(7, "D")   # zoom in: last week of the test set
+    t_test, pred_np, y_np = t_test[week], pred_np[week], y_np[week]
 
     fig_dir = Path("figures")
     fig_dir.mkdir(exist_ok=True)
@@ -269,14 +272,14 @@ def main():
         ax.plot(t_test, y_np[:, i], lw=0.8, color="steelblue", label="true")
         ax.plot(t_test, pred_np[:, i], lw=0.8, alpha=0.85, color="darkorange",
                 label="predicted (30 min ahead)")
-        ax.set_title(f"sensor {sid} - test set, RMSE {err:.1f} vehicles/hour")
+        ax.set_title(f"sensor {sid} - last week of test, RMSE {err:.1f} vehicles/hour")
         ax.set_ylabel("vehicles/hour")
         ax.legend(loc="upper right")
         fig.autofmt_xdate()
         fig.tight_layout()
-        fig.savefig(fig_dir / f"sensor_{sid}.png", dpi=100)
+        fig.savefig(fig_dir / f"sensor_{sid}.png", dpi=250)
         plt.close(fig)
-    print(f"  figures: {fig_dir}/sensor_*.png (10 sensors over the test set)")
+    print(f"  figures: {fig_dir}/sensor_*.png (10 sensors, last week of the test set)")
 
 
 if __name__ == "__main__":

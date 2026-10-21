@@ -1,5 +1,8 @@
+*.csv
+*.pkl
+*.parquet
 data/
-rq1/data/
-.ipynb_checkpoints/
-*.bak
-add_district_selection.py
+.venv/
+__pycache__/
+.DS_Store
+figures/

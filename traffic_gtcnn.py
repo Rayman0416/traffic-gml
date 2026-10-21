@@ -1,9 +1,7 @@
 # Copy of the Lab 2.3 GTCNN (graph-time CNN) applied to GO-MO Madrid traffic.
 # Takes district-1 intensity + occupancy + time-of-day (tod_sin, sin(t*pi/96)^2)
-# over the last WINDOW steps and predicts the intensity 8 steps (2 hours) ahead. The network
+# over the last WINDOW steps and predicts the intensity HORIZON steps ahead. The network
 # runs a K-tap graph filter on a Cartesian product graph over space x time, as in Lab 2.3.
-#
-# python traffic_gtcnn.py        # device=mps, batch size 16384
 #
 # Only reads data/forecast_dataset (built by `python -m preprocess.run`).
 
@@ -53,7 +51,7 @@ def load_sensors() -> np.ndarray:
 
 def load_split_tensors(cols: np.ndarray, split: str):
     """X [n, WINDOW, N, 4] input windows (intensity, occupancy, tod_sin, day_sin2),
-    y [n, N] intensity at +2 hours (HORIZON steps), the genuine-target mask, and the target row indices
+    y [n, N] intensity at HORIZON steps ahead, the genuine-target mask, and the target row indices
     (for plotting against the clock)."""
     z = np.load(DATA_DIR / "features.npz")
     intensity = z["intensity"][:, cols]        # [T, N] scaled intensity
@@ -77,7 +75,7 @@ def load_split_tensors(cols: np.ndarray, split: str):
                         for r in csv.DictReader(open(DATA_DIR / "windows.csv"))
                         if r["split"] == split and r["eligible_routine"] == "True"],
                        dtype=np.int64)
-    targets = origins + HORIZON              # windows.csv stops at h4, so compute h8 directly
+    targets = origins + HORIZON              # target row index for each window
     ok = targets < len(intensity)            # drop windows whose target runs past the dataset end
     origins, targets = origins[ok], targets[ok]
 

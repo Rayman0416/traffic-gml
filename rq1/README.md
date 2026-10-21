@@ -4,9 +4,9 @@ This folder holds the non-graph forecasting models for RQ1 and the shared datase
 are evaluated on, so the baselines and the neural network are directly comparable.
 
 ## Contents
-- `baseline_nongraph.ipynb` -- Kaushik: persistence, seasonal, and linear regression.
-- `alice_nn.ipynb` -- Alice: small neural network (add here).
-- `data/forecast_dataset/` -- the shared dataset: `features.npz`, `params.npz`, `windows.csv`.
+- 'baseline_nongraph.ipynb' - Kaushik: persistence, seasonal, and linear regression.
+- 'alice_nn.ipynb' - Alice: small neural network (add here).
+- 'data/forecast_dataset/' - the shared dataset: 'features.npz', 'params.npz', 'windows.csv'.
 
 ## Running
 Open either notebook and Run All. Both read `data/forecast_dataset`, so they train and

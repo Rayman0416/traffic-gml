@@ -13,7 +13,6 @@ import matplotlib
 import numpy as np
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -164,10 +163,6 @@ def masked_mae(pred, y, mask):
 LOSSES = {"rmse": masked_rmse, "mae": masked_mae}
 
 
-def masked_mae(pred, y, mask):
-    return ((pred - y).abs() * mask).sum() / mask.sum().clamp(min=1)
-
-
 # --------------------------------------------------------------- train
 
 def run_epoch(model, X, y, mask, optimizer=None):
@@ -176,13 +171,14 @@ def run_epoch(model, X, y, mask, optimizer=None):
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
-            loss = LOSSES[LOSS](model(xb), yb, mb)
+            pred = model(xb)
+            loss = LOSSES[LOSS](pred, yb, mb)
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
         total += loss.item() * len(xb)
-        mae_total += masked_mae(pred.detach(), yb, mb).item() * len(xb)   # metric only, MSE stays the loss
+        mae_total += masked_mae(pred.detach(), yb, mb).item() * len(xb)   # metric only, LOSS stays the training loss
         count += len(xb)
     return total / count, mae_total / count
 
@@ -246,15 +242,15 @@ def main():
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
-        tr_mse, tr_mae = run_epoch(model, *data["train"][:3], optimizer)
-        va_mse, va_mae = run_epoch(model, *data["val"][:3])
+        tr, tr_mae = run_epoch(model, *data["train"][:3], optimizer)
+        va, va_mae = run_epoch(model, *data["val"][:3])
         scheduler.step()
 
         # keep the weights with the lowest val loss
         if va < best_val - MIN_DELTA:
             best_val, best_epoch = va, epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        print(f"epoch {epoch:2d}  train {LOSS} {tr:.4f}  val {LOSS} {va:.4f}"
+        print(f"epoch {epoch:2d}  train {LOSS} {tr:.4f}  val {LOSS} {va:.4f}  val mae {va_mae:.4f}"
               f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
               flush=True)
 

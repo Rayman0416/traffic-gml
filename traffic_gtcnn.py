@@ -22,10 +22,14 @@ DISTRICT = 1              # only district 1, for faster training
 WINDOW = 3                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead up to 4 (1 = 15 min, 2 = 30 min, 3 = 45 min, 4 = 60 min)
 N_TAPS = 3                # graph filter order
-N_FEAT = 12                # hidden features per layer
+N_FEAT = 32                # hidden features per layer
 BATCH_SIZE = int(16384*2)
 EPOCHS = 300
 LR = 5e-3
+LR_DECAY = 0.995          # per-epoch lr factor: 0.995^300 = 0.22, so the last epochs still learn
+PATIENCE = 30             # early stopping: stop after this many epochs without a val improvement
+MIN_DELTA = 1e-4          # smallest val loss drop that counts as an improvement
+LOSS = "mae"             # training loss: "rmse" or "mae" (both are reported on test)
 
 
 # ---------------------------------------------------------------- data
@@ -156,6 +160,8 @@ def masked_mae(pred, y, mask):
     """Mean absolute error over the observed targets only (mask=1)."""
     return (torch.abs(pred - y) * mask).sum() / mask.sum().clamp(min=1)
 
+LOSSES = {"rmse": masked_rmse, "mae": masked_mae}
+
 
 # --------------------------------------------------------------- train
 
@@ -165,7 +171,7 @@ def run_epoch(model, X, y, mask, optimizer=None):
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
-            loss = masked_rmse(model(xb), yb, mb)
+            loss = LOSSES[LOSS](model(xb), yb, mb)
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
@@ -185,6 +191,7 @@ def main():
 
     # check HORIZON is below/equal to 4 (preprocessed dataset limit)
     assert 1 <= HORIZON <= 4, "HORIZON must be between 1 and 4 (inclusive)"
+    assert LOSS in LOSSES, f"LOSS must be one of {list(LOSSES)}"
 
     # load data
     cols = load_sensors()
@@ -226,7 +233,7 @@ def main():
 
     # hyperparameters
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=LR_DECAY)
 
     # train loop
     best_val, best_epoch, best_state = float("inf"), 0, None
@@ -237,20 +244,25 @@ def main():
         va = run_epoch(model, *data["val"][:3])
         scheduler.step()
 
-        # keep the weights with the lowest val mse
-        if va < best_val:
+        # keep the weights with the lowest val loss
+        if va < best_val - MIN_DELTA:
             best_val, best_epoch = va, epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        print(f"epoch {epoch:2d}  train mse {tr:.4f}  val mse {va:.4f}"
+        print(f"epoch {epoch:2d}  train {LOSS} {tr:.4f}  val {LOSS} {va:.4f}"
               f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
               flush=True)
-        
+
+        # early stopping: no real val improvement for PATIENCE epochs
+        if epoch - best_epoch >= PATIENCE:
+            print(f"early stop at epoch {epoch}: no val improvement > {MIN_DELTA} for {PATIENCE} epochs")
+            break
+
     train_seconds = time.perf_counter() - train_start
-    print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, {train_seconds / EPOCHS:.1f}s/epoch)")
+    print(f"training time {train_seconds:.1f}s ({epoch} epochs, {train_seconds / epoch:.1f}s/epoch)")
 
     # evaluate the best-val epoch
     model.load_state_dict(best_state)
-    print(f"best val mse {best_val:.4f} at epoch {best_epoch}")
+    print(f"best val {LOSS} {best_val:.4f} at epoch {best_epoch}")
 
     # test error in vehicles per hour, undoing the per-sensor standardisation
     p = np.load(DATA_DIR / "params.npz")
@@ -264,18 +276,21 @@ def main():
     # convert back to vehicles/hour
     pred = pred * std + mean
     y_phys = y * std + mean
-    rmse = masked_rmse(pred, y_phys, mask).item()
 
-    # persistence baseline: predict the current reading (last timestep of the input window) for every target
-    now = X_test[:, -1, :, 0] * std + mean       
+    # persistence baseline: predict the current reading (last timestep of the input window) for every target,
+    # scored only where that current reading is observed (a missing one is stored as 0 = the mean)
+    now = X_test[:, -1, :, 0] * std + mean
     mask_now = mask & (X_test[:, -1, :, 4] > 0.5)
-    rmse_now = masked_rmse(pred, y_phys, mask_now).item()
-    rmse_persistence = masked_rmse(now, y_phys, mask_now).item()
-    print(f"test rmse ({HORIZON * 15} min ahead, district {DISTRICT}):")
-    print(f"  GTCNN       {rmse:.2f} vehicles/hour (all observed targets)")
-    print(f"  GTCNN       {rmse_now:.2f} vehicles/hour (current reading also observed: "
-          f"{mask_now.sum().item()} of {mask.sum().item()} targets)")
-    print(f"  persistence {rmse_persistence:.2f} vehicles/hour (predict current intensity, same subset)")
+
+    # overview: test error in vehicles/hour, both metrics, GTCNN vs persistence
+    rows = [("GTCNN", pred, mask, "all observed targets"),
+            ("GTCNN", pred, mask_now, "current reading also observed"),
+            ("persistence", now, mask_now, "current reading also observed")]
+    print(f"\ntest overview ({HORIZON * 15} min ahead, district {DISTRICT}, trained on {LOSS}, vehicles/hour):")
+    print(f"  {'model':<12} {'RMSE':>8} {'MAE':>8} {'targets':>9}  subset")
+    for name, p_, m_, subset in rows:
+        print(f"  {name:<12} {masked_rmse(p_, y_phys, m_).item():8.2f} {masked_mae(p_, y_phys, m_).item():8.2f}"
+              f" {m_.sum().item():9d}  {subset}")
 
     # ----------------- figures: 10 sensors, prediction vs truth, last week of the test set
     z = np.load(DATA_DIR / "features.npz")

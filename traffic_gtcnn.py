@@ -15,19 +15,20 @@ import matplotlib
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
 DISTRICT = 1              # only district 1, for faster training
-WINDOW = 3                # input window in timesteps (features.npz history_length)
+WINDOW = 6                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
-N_TAPS = 3                # graph filter order
+N_TAPS = 2                # graph filter order
 N_FEAT = 12                # hidden features per layer
-BATCH_SIZE = int(16384*2)
-EPOCHS = 300
-LR = 5e-3
+BATCH_SIZE = int(16384*1)
+EPOCHS = 100
+LR = 5e-2
 
 
 # ---------------------------------------------------------------- data
@@ -131,9 +132,9 @@ class GTCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 4]
         z = x.reshape(x.shape[0], -1, x.shape[-1])                 # [B, WINDOW*N, C]
-        z = torch.relu(self.filter1(z))
-        z = torch.relu(self.filter2(z))
-        z = torch.relu(self.filter3(z))                            # [B, WINDOW*N, F]
+        z = torch.relu(self.filter1(z)) #was relu
+        z = torch.relu(self.filter2(z)) #was relu
+        z = torch.relu(self.filter3(z))     # [B, WINDOW*N, F]
         z = z.reshape(x.shape[0], WINDOW, self.n_sensors, -1)      # [B, T, N, F]
         z = z.permute(0, 2, 1, 3).flatten(2)                       # [B, N, T*F]
         return self.head(z).squeeze(-1)                            # [B, N]
@@ -154,22 +155,28 @@ def masked_mse(pred, y, mask):
     return ((pred - y) ** 2 * mask).sum() / mask.sum().clamp(min=1)
 
 
+def masked_mae(pred, y, mask):
+    return ((pred - y).abs() * mask).sum() / mask.sum().clamp(min=1)
+
+
 # --------------------------------------------------------------- train
 
 def run_epoch(model, X, y, mask, optimizer=None):
     model.train(optimizer is not None)
-    total, count = 0.0, 0
+    total, mae_total, count = 0.0, 0.0, 0
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
-            loss = masked_mse(model(xb), yb, mb)
+            pred = model(xb)
+            loss = masked_mse(pred, yb, mb)
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
         total += loss.item() * len(xb)
+        mae_total += masked_mae(pred.detach(), yb, mb).item() * len(xb)   # metric only, MSE stays the loss
         count += len(xb)
-    return total / count
+    return total / count, mae_total / count
 
 
 def main():
@@ -208,10 +215,11 @@ def main():
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
-        tr = run_epoch(model, *data["train"][:3], optimizer)
-        va = run_epoch(model, *data["val"][:3])
+        tr_mse, tr_mae = run_epoch(model, *data["train"][:3], optimizer)
+        va_mse, va_mae = run_epoch(model, *data["val"][:3])
         scheduler.step()
-        print(f"epoch {epoch:2d}  train mse {tr:.4f}  val mse {va:.4f}"
+        print(f"epoch {epoch:2d}  train mse {tr_mse:.4f} mae {tr_mae:.4f}"
+              f"  val mse {va_mse:.4f} mae {va_mae:.4f}"
               f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
               flush=True)
     train_seconds = time.perf_counter() - train_start
@@ -230,11 +238,14 @@ def main():
     pred = pred * std + mean
     y_phys = y * std + mean
     rmse = torch.sqrt(masked_mse(pred, y_phys, mask)).item()
+    mae = masked_mae(pred, y_phys, mask).item()
     now = X_test[:, -1, :, 0] * std + mean       # persistence: traffic now = traffic at horizon
     rmse_persistence = torch.sqrt(masked_mse(now, y_phys, mask)).item()
-    print(f"test rmse ({HORIZON * 15} min ahead, district {DISTRICT}):")
-    print(f"  GTCNN       {rmse:.2f} vehicles/hour")
-    print(f"  persistence {rmse_persistence:.2f} vehicles/hour (predict current intensity)")
+    mae_persistence = masked_mae(now, y_phys, mask).item()
+    print(f"test rmse/mae ({HORIZON * 15} min ahead, district {DISTRICT}):")
+    print(f"  GTCNN        rmse {rmse:.2f}  mae {mae:.2f} vehicles/hour")
+    print(f"  persistence  rmse {rmse_persistence:.2f}  mae {mae_persistence:.2f}"
+          f" vehicles/hour (predict current intensity)")
 
     # ----------------- figures: 10 sensors, prediction vs truth, last week of the test set
     z = np.load(DATA_DIR / "features.npz")

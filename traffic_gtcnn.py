@@ -13,6 +13,7 @@ import matplotlib
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -133,9 +134,9 @@ class GTCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 7]
         z = x.reshape(x.shape[0], -1, x.shape[-1])                 # [B, WINDOW*N, C]
-        z = torch.relu(self.filter1(z))
-        z = torch.relu(self.filter2(z))
-        z = torch.relu(self.filter3(z))                            # [B, WINDOW*N, F]
+        z = torch.relu(self.filter1(z)) #was relu
+        z = torch.relu(self.filter2(z)) #was relu
+        z = torch.relu(self.filter3(z))     # [B, WINDOW*N, F]
         z = z.reshape(x.shape[0], WINDOW, self.n_sensors, -1)      # [B, T, N, F]
         z = z.permute(0, 2, 1, 3).flatten(2)                       # [B, N, T*F]
         return self.head(z).squeeze(-1)                            # [B, N]
@@ -163,11 +164,15 @@ def masked_mae(pred, y, mask):
 LOSSES = {"rmse": masked_rmse, "mae": masked_mae}
 
 
+def masked_mae(pred, y, mask):
+    return ((pred - y).abs() * mask).sum() / mask.sum().clamp(min=1)
+
+
 # --------------------------------------------------------------- train
 
 def run_epoch(model, X, y, mask, optimizer=None):
     model.train(optimizer is not None)
-    total, count = 0.0, 0
+    total, mae_total, count = 0.0, 0.0, 0
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
@@ -177,8 +182,9 @@ def run_epoch(model, X, y, mask, optimizer=None):
                 loss.backward()
                 optimizer.step()
         total += loss.item() * len(xb)
+        mae_total += masked_mae(pred.detach(), yb, mb).item() * len(xb)   # metric only, MSE stays the loss
         count += len(xb)
-    return total / count
+    return total / count, mae_total / count
 
 
 def main():
@@ -240,8 +246,8 @@ def main():
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
-        tr = run_epoch(model, *data["train"][:3], optimizer)
-        va = run_epoch(model, *data["val"][:3])
+        tr_mse, tr_mae = run_epoch(model, *data["train"][:3], optimizer)
+        va_mse, va_mae = run_epoch(model, *data["val"][:3])
         scheduler.step()
 
         # keep the weights with the lowest val loss

@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 DATA_DIR = Path("data/forecast_dataset")
 DISTRICT = 1              # only district 1, for faster training
 WINDOW = 3                # input window in timesteps (features.npz history_length)
-HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
+HORIZON = 2               # target steps ahead up to 4 (1 = 15 min, 2 = 30 min, 3 = 45 min, 4 = 60 min)
 N_TAPS = 3                # graph filter order
 N_FEAT = 12                # hidden features per layer
 BATCH_SIZE = int(16384*2)
@@ -50,7 +50,7 @@ def load_sensors() -> np.ndarray:
 
 
 def load_split_tensors(cols: np.ndarray, split: str):
-    """X [n, WINDOW, N, 4] input windows (intensity, occupancy, tod_sin, day_sin2),
+    """X [n, WINDOW, N, 5] input windows (intensity, occupancy, tod_sin, day_sin2, observed),
     y [n, N] intensity at HORIZON steps ahead, the genuine-target mask, and the target row indices
     (for plotting against the clock)."""
     z = np.load(DATA_DIR / "features.npz")
@@ -80,11 +80,12 @@ def load_split_tensors(cols: np.ndarray, split: str):
     origins, targets = origins[ok], targets[ok]
 
     rows = origins[:, None] + np.arange(-WINDOW + 1, 1)[None, :]   # [n, WINDOW]
-    X = np.empty(rows.shape + (len(cols), 4), dtype=np.float32)
+    X = np.empty(rows.shape + (len(cols), 5), dtype=np.float32)
     X[..., 0] = intensity[rows]                 # traffic intensity
     X[..., 1] = occupancy[rows]                 # occupancy
     X[..., 2] = tod_sin[rows][:, :, None]       # time-of-day, same at every node
     X[..., 3] = day_sin2[rows][:, :, None]      # sin(pi*t/96)^2 day bump
+    X[..., 4] = observed[rows]                  # 1 = real reading, 0 = missing/interpolated (intensity stored as 0)
     y = torch.from_numpy(intensity[targets])    # [n, N]
     mask = torch.from_numpy(observed[targets])  # [n, N]
     return torch.from_numpy(X), y, mask, torch.from_numpy(targets)
@@ -122,12 +123,12 @@ class GTCNN(nn.Module):
     def __init__(self, S: torch.Tensor, n_sensors: int):
         super().__init__()
         self.n_sensors = n_sensors
-        self.filter1 = GraphFilter(S, 4, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2
+        self.filter1 = GraphFilter(S, 5, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2, observed
         self.filter2 = GraphFilter(S, N_FEAT, N_FEAT)
         self.filter3 = GraphFilter(S, N_FEAT, N_FEAT)
         self.head = nn.Linear(WINDOW * N_FEAT, 1)      # the same head at every node
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 4]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 5]
         z = x.reshape(x.shape[0], -1, x.shape[-1])                 # [B, WINDOW*N, C]
         z = torch.relu(self.filter1(z))
         z = torch.relu(self.filter2(z))
@@ -148,8 +149,13 @@ def check_node_shared(model, S_product, x, n_sensors):
     assert torch.allclose(model(x)[:, pi], twin(x[:, :, pi]), atol=1e-5), "node sharing violated"
 
 
-def masked_mse(pred, y, mask):
-    return ((pred - y) ** 2 * mask).sum() / mask.sum().clamp(min=1)
+def masked_rmse(pred, y, mask):
+    """Root mean squared error over the observed targets only (mask=1)."""
+    return torch.sqrt((torch.square(pred - y) * mask).sum() / mask.sum().clamp(min=1))
+
+def masked_mae(pred, y, mask):
+    """Mean absolute error over the observed targets only (mask=1)."""
+    return (torch.abs(pred - y) * mask).sum() / mask.sum().clamp(min=1)
 
 
 # --------------------------------------------------------------- train
@@ -160,7 +166,7 @@ def run_epoch(model, X, y, mask, optimizer=None):
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
-            loss = masked_mse(model(xb), yb, mb)
+            loss = masked_rmse(model(xb), yb, mb)
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
@@ -171,50 +177,78 @@ def run_epoch(model, X, y, mask, optimizer=None):
 
 
 def main():
-    torch.manual_seed(0)
+    torch.manual_seed(0) # reproducible starting point for model weights
     device = torch.device(
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
+
+    # load data
     cols = load_sensors()
     n_sensors = len(cols)
     S = load_district_graph(n_sensors)
 
     # Cartesian product graph over space x time (Lab 2.3: s01 = s10 = 1, s00 = s11 = 0)
-    S_time = torch.diag(torch.ones(WINDOW - 1), -1)                # past -> present chain
+    S_time = torch.diag(torch.ones(WINDOW - 1), -1) # past -> present chain
     S_product = torch.kron(torch.eye(WINDOW), S) + torch.kron(S_time, torch.eye(n_sensors))
     assert S_product.shape == (WINDOW * n_sensors, WINDOW * n_sensors)
 
-    data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s))
-            for s in ("train", "val", "test")}
-    print(f"device={device} district={DISTRICT} sensors={n_sensors} "
-          f"space-time nodes={WINDOW * n_sensors} batch size={BATCH_SIZE}")
-    for s, (X, y, *_) in data.items():
-        print(f"  {s:5s} {len(X):,} windows")
+    # load data in train/val/test splits
+    data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s)) for s in ("train", "val", "test")}
+    print("device:", device)
+    print("district", DISTRICT, "with", n_sensors, "sensors")
 
-    model = GTCNN(S_product.to(device), n_sensors).to(device)   # default init, seeded by manual_seed above
+    # n = number of windows, N = number of sensors, 
+    # 5 features per node (intensity, occupancy, tod_sin, day_sin2, observed)
+    # X [n, WINDOW, N, 5] input windows
+    # y [n, N] intensity at HORIZON steps ahead
+    # mask [n, N] ground truth mask (1 = observed, 0 = missing) -> dont use missing targets to predict on
+    # targets [n] row indices of the target timestep for each window
+    for s, (X, y, mask, targets) in data.items():
+        missing = (~mask).sum().item()
+        print(s, "windows:", len(X), "missing targets:", missing, "of", mask.numel())
+        assert (y[~mask] == 0).all(), f"{s}: missing targets should be stored as 0"
+        assert torch.isfinite(X).all() and torch.isfinite(y).all(), f"{s}: non-finite data"
+
+    model = GTCNN(S_product.to(device), n_sensors).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
-    print(f"  model parameters: {n_params:,}")
-    check_node_shared(model, S_product.to(device), data["train"][0][:8], n_sensors)
-    model = torch.compile(model)      # fuses the per-node ops, measured ~1.4x on top of the fused filter
+    print(f"model parameters: {n_params:,}")
+    check_node_shared(model, S_product.to(device), data["train"][0][:8], n_sensors) # TO:DO remove this check in the final version
+    model = torch.compile(model) # fuses the per-node ops, measured ~1.4x on top of the fused filter
 
+    # checks
+    assert torch.isfinite(S).all(), "non-finite S"
+    assert torch.isfinite(S_product).all(), "non-finite S_product"
+    assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
+
+    # hyperparameters
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    # smooth, gentle decay: lr * GAMMA^epoch (halves over ~69 epochs, never bottoms out)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+
+    # train loop
+    best_val, best_epoch, best_state = float("inf"), 0, None
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
         tr = run_epoch(model, *data["train"][:3], optimizer)
         va = run_epoch(model, *data["val"][:3])
         scheduler.step()
+
+        # keep the weights with the lowest val mse
+        if va < best_val:
+            best_val, best_epoch = va, epoch
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         print(f"epoch {epoch:2d}  train mse {tr:.4f}  val mse {va:.4f}"
               f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
               flush=True)
+        
     train_seconds = time.perf_counter() - train_start
-    print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, "
-          f"{train_seconds / EPOCHS:.1f}s/epoch)")
+    print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, {train_seconds / EPOCHS:.1f}s/epoch)")
+
+    # evaluate the best-val epoch
+    model.load_state_dict(best_state)
+    print(f"best val mse {best_val:.4f} at epoch {best_epoch}")
 
     # test error in vehicles per hour, undoing the per-sensor standardisation
     p = np.load(DATA_DIR / "params.npz")
@@ -223,16 +257,23 @@ def main():
     X_test, y, mask, targets_test = data["test"]
     model.eval()
     with torch.no_grad():
-        pred = torch.cat([model(X_test[b:b + BATCH_SIZE])
-                          for b in range(0, len(X_test), BATCH_SIZE)])
+        pred = torch.cat([model(X_test[b:b + BATCH_SIZE]) for b in range(0, len(X_test), BATCH_SIZE)])
+
+    # convert back to vehicles/hour
     pred = pred * std + mean
     y_phys = y * std + mean
-    rmse = torch.sqrt(masked_mse(pred, y_phys, mask)).item()
-    now = X_test[:, -1, :, 0] * std + mean       # persistence: traffic now = traffic at horizon
-    rmse_persistence = torch.sqrt(masked_mse(now, y_phys, mask)).item()
+    rmse = masked_rmse(pred, y_phys, mask).item()
+
+    # persistence baseline: predict the current reading (last timestep of the input window) for every target
+    now = X_test[:, -1, :, 0] * std + mean       
+    mask_now = mask & (X_test[:, -1, :, 4] > 0.5)
+    rmse_now = masked_rmse(pred, y_phys, mask_now).item()
+    rmse_persistence = masked_rmse(now, y_phys, mask_now).item()
     print(f"test rmse ({HORIZON * 15} min ahead, district {DISTRICT}):")
-    print(f"  GTCNN       {rmse:.2f} vehicles/hour")
-    print(f"  persistence {rmse_persistence:.2f} vehicles/hour (predict current intensity)")
+    print(f"  GTCNN       {rmse:.2f} vehicles/hour (all observed targets)")
+    print(f"  GTCNN       {rmse_now:.2f} vehicles/hour (current reading also observed: "
+          f"{mask_now.sum().item()} of {mask.sum().item()} targets)")
+    print(f"  persistence {rmse_persistence:.2f} vehicles/hour (predict current intensity, same subset)")
 
     # ----------------- figures: 10 sensors, prediction vs truth, last week of the test set
     z = np.load(DATA_DIR / "features.npz")

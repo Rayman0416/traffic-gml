@@ -24,10 +24,10 @@ DISTRICT = 1              # only district 1, for faster training
 WINDOW = 3                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
 N_TAPS = 3                # graph filter order
-N_FEAT = 8                # hidden features per layer
+N_FEAT = 12                # hidden features per layer
 BATCH_SIZE = int(16384*2)
-EPOCHS = 50
-LR = 2e-3
+EPOCHS = 300
+LR = 5e-3
 
 
 # ---------------------------------------------------------------- data
@@ -174,8 +174,11 @@ def run_epoch(model, X, y, mask, optimizer=None):
 
 def main():
     torch.manual_seed(0)
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
     cols = load_sensors()
     n_sensors = len(cols)
     S = load_district_graph(n_sensors)

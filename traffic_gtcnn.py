@@ -1,5 +1,5 @@
 # Copy of the Lab 2.3 GTCNN (graph-time CNN) applied to GO-MO Madrid traffic.
-# Takes district-1 intensity + occupancy + time-of-day (tod_sin, sin(t*pi/96)^2)
+# Takes DISTRICT intensity + occupancy + time-of-day (tod_sin, tod_cos)
 # over the last WINDOW steps and predicts the intensity HORIZON steps ahead. The network
 # runs a K-tap graph filter on a Cartesian product graph over space x time, as in Lab 2.3.
 #
@@ -50,7 +50,7 @@ def load_sensors() -> np.ndarray:
 
 
 def load_split_tensors(cols: np.ndarray, split: str):
-    """X [n, WINDOW, N, 5] input windows (intensity, occupancy, tod_sin, day_sin2, observed),
+    """X [n, WINDOW, N, 7] input windows (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos),
     y [n, N] intensity at HORIZON steps ahead, the genuine-target mask, and the target row indices
     (for plotting against the clock)."""
     z = np.load(DATA_DIR / "features.npz")
@@ -58,18 +58,15 @@ def load_split_tensors(cols: np.ndarray, split: str):
     observed = z["intensity_mask"][:, cols]    # [T, N] genuine observations
     occupancy = z["occupancy"][:, cols]        # [T, N] scaled occupancy (missing = 0)
 
-    # tod_sin = sin(2*pi*slot/96) from the dataset (formula audited against the timestamps),
-    # plus the day_sin2 = sin(pi*t/96)^2 bump on the absolute timestep: squaring gives an
-    # exact 96-row period (no 48 h issue), 0 at 00:00, 1 at noon, same every day. It equals
-    # (1 - tod_cos)/2 exactly (asserted below), so with tod_sin the pair carries the full
-    # day phase again - noon and midnight are distinguishable. Selected by name, not position.
+    # time features: tod_sin, tod_cos, dow_sin, dow_cos
     names = list(z["time_feature_names"])
     tf = z["time_features"]                       # [T, 4] tod_sin, tod_cos, dow_sin, dow_cos
     tod_sin = tf[:, names.index("tod_sin")]
     tod_cos = tf[:, names.index("tod_cos")]
-    day_sin2 = np.sin(np.pi * np.arange(len(tf)) / 96.0) ** 2
-    assert np.allclose(day_sin2, (1.0 - tod_cos) / 2.0, atol=1e-6), "sin(pi*t/96)^2 must be (1-tod_cos)/2"
-    assert abs(day_sin2[0]) < 1e-6 and abs(day_sin2[48] - 1) < 1e-6, "must be 0 at 00:00, 1 at noon"
+    dow_sin = tf[:, names.index("dow_sin")]       # sin/cos(2*pi*dow/7), Monday = 0, constant per day
+    dow_cos = tf[:, names.index("dow_cos")]
+    assert np.allclose(tod_cos, np.cos(2 * np.pi * np.arange(len(tf)) / 96.0), atol=1e-6), \
+        "tod_cos must be cos(2*pi*t/96): 1 at 00:00, -1 at noon"
 
     origins = np.array([int(r["origin_index"])
                         for r in csv.DictReader(open(DATA_DIR / "windows.csv"))
@@ -80,12 +77,14 @@ def load_split_tensors(cols: np.ndarray, split: str):
     origins, targets = origins[ok], targets[ok]
 
     rows = origins[:, None] + np.arange(-WINDOW + 1, 1)[None, :]   # [n, WINDOW]
-    X = np.empty(rows.shape + (len(cols), 5), dtype=np.float32)
+    X = np.empty(rows.shape + (len(cols), 7), dtype=np.float32)
     X[..., 0] = intensity[rows]                 # traffic intensity
     X[..., 1] = occupancy[rows]                 # occupancy
     X[..., 2] = tod_sin[rows][:, :, None]       # time-of-day, same at every node
-    X[..., 3] = day_sin2[rows][:, :, None]      # sin(pi*t/96)^2 day bump
+    X[..., 3] = tod_cos[rows][:, :, None]
     X[..., 4] = observed[rows]                  # 1 = real reading, 0 = missing/interpolated (intensity stored as 0)
+    X[..., 5] = dow_sin[rows][:, :, None]       # day-of-week, weekday vs weekend
+    X[..., 6] = dow_cos[rows][:, :, None]
     y = torch.from_numpy(intensity[targets])    # [n, N]
     mask = torch.from_numpy(observed[targets])  # [n, N]
     return torch.from_numpy(X), y, mask, torch.from_numpy(targets)
@@ -123,12 +122,12 @@ class GTCNN(nn.Module):
     def __init__(self, S: torch.Tensor, n_sensors: int):
         super().__init__()
         self.n_sensors = n_sensors
-        self.filter1 = GraphFilter(S, 5, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2, observed
+        self.filter1 = GraphFilter(S, 7, N_FEAT)   # channels: intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos
         self.filter2 = GraphFilter(S, N_FEAT, N_FEAT)
         self.filter3 = GraphFilter(S, N_FEAT, N_FEAT)
         self.head = nn.Linear(WINDOW * N_FEAT, 1)      # the same head at every node
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 5]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 7]
         z = x.reshape(x.shape[0], -1, x.shape[-1])                 # [B, WINDOW*N, C]
         z = torch.relu(self.filter1(z))
         z = torch.relu(self.filter2(z))
@@ -184,6 +183,9 @@ def main():
         else "cpu"
     )
 
+    # check HORIZON is below/equal to 4 (preprocessed dataset limit)
+    assert 1 <= HORIZON <= 4, "HORIZON must be between 1 and 4 (inclusive)"
+
     # load data
     cols = load_sensors()
     n_sensors = len(cols)
@@ -200,8 +202,8 @@ def main():
     print("district", DISTRICT, "with", n_sensors, "sensors")
 
     # n = number of windows, N = number of sensors, 
-    # 5 features per node (intensity, occupancy, tod_sin, day_sin2, observed)
-    # X [n, WINDOW, N, 5] input windows
+    # 7 features per node (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos)
+    # X [n, WINDOW, N, 7] input windows
     # y [n, N] intensity at HORIZON steps ahead
     # mask [n, N] ground truth mask (1 = observed, 0 = missing) -> dont use missing targets to predict on
     # targets [n] row indices of the target timestep for each window

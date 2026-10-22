@@ -19,15 +19,15 @@ import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
 DISTRICT = None           # None = every district in the dataset (full graph), or a district number
-WINDOW = 3                # input window in timesteps (features.npz history_length)
+WINDOW = 6                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead up to 4 (1 = 15 min, 2 = 30 min, 3 = 45 min, 4 = 60 min)
 N_TAPS = 3                # graph filter order
-N_FEAT = 32                # hidden features per layer
-BATCH_SIZE = 256          # full graph (1054 sensors): ~5 GB peak on an 8 GB GPU; 1024+ spills to system RAM
+N_FEAT = 32               # hidden features per layer
+BATCH_SIZE = 256          # full graph (1054 sensors), WINDOW = 6: lower it if the GPU runs out of memory
 EPOCHS = 100
 LR = 5e-3
 LR_DECAY = 0.995          # per-epoch lr factor: 0.995^300 = 0.22, so the last epochs still learn
-PATIENCE = 30             # early stopping: stop after this many epochs without a val improvement
+PATIENCE = 10             # early stopping: stop after this many epochs without a val improvement
 MIN_DELTA = 1e-4          # smallest val loss drop that counts as an improvement
 LOSS = "mae"             # training loss: "rmse" or "mae" (both are reported on test)
 
@@ -53,7 +53,8 @@ def load_district_graph(n_sensors: int) -> torch.Tensor:
         i, j = int(e["target_index"]), int(e["source_index"])
         A[i, j] = A[j, i] = 1.0        # treat routes as undirected for influence
     d = A.sum(axis=1)
-    d_inv_sqrt = np.where(d > 0, d ** -0.5, 0.0).astype(np.float32)
+    d_inv_sqrt = np.zeros_like(d)
+    np.power(d, -0.5, out=d_inv_sqrt, where=d > 0)   # isolated sensors (degree 0) stay 0
     return torch.from_numpy(d_inv_sqrt[:, None] * A * d_inv_sqrt[None, :])
 
 
@@ -109,22 +110,23 @@ def load_split_tensors(cols: np.ndarray, split: str):
 # ------------------------------------------------------------ network
 
 class GraphFilter(nn.Module):
-    """One LSIGF layer from the GTCNN: y = sum_k S^k x W_k + b."""
+    """One LSIGF layer from the GTCNN: y = sum_k S^k x W_k + b.
+    S is kept sparse and S^k x is built as S(S(...x)), so no dense NT x NT powers are stored."""
 
     def __init__(self, S: torch.Tensor, n_feat_in: int, n_feat_out: int):
         super().__init__()
-        powers = [torch.eye(S.shape[0], dtype=S.dtype, device=S.device)]
-        for _ in range(N_TAPS - 1):
-            powers.append(powers[-1] @ S)
-        self.register_buffer("powers", torch.stack(powers))       # [N_TAPS, NT, NT]
+        self.register_buffer("S", S.to_sparse().coalesce())       # [NT, NT] sparse
         self.weight = nn.Parameter(torch.empty(N_TAPS, n_feat_in, n_feat_out))
         self.bias = nn.Parameter(torch.zeros(n_feat_out))
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:            # x: [B, NT, F_in]
+        B, NT, F = x.shape
         taps = [x]                                    # S^0 x = x, no multiply needed
-        for k in range(1, N_TAPS):
-            taps.append(torch.einsum("nm,bmf->bnf", self.powers[k], x))
+        z = x.permute(1, 0, 2).reshape(NT, B * F)     # [NT, B*F]: one sparse matmul for the whole batch
+        for _ in range(1, N_TAPS):
+            z = torch.sparse.mm(self.S, z)            # S^k x = S (S^(k-1) x)
+            taps.append(z.reshape(NT, B, F).permute(1, 0, 2))
         # all taps in one contraction: y = sum_k S^k x W_k + b (fewer MPS kernel launches)
         W = self.weight.permute(2, 0, 1).reshape(self.weight.shape[2], -1)
         return nn.functional.linear(torch.cat(taps, dim=-1), W) + self.bias
@@ -133,7 +135,8 @@ class GraphFilter(nn.Module):
 class GTCNN(nn.Module):
     """Three product-graph filter layers and one shared head. Every node runs the exact
     same network with the same weights: shared filters (neighbour mixing) plus the same
-    per-node readout. No node-private parameters."""
+    per-node readout. No node-private parameters. The head predicts the change from the
+    current reading (persistence), so an untrained network starts close to persistence."""
 
     def __init__(self, S: torch.Tensor, n_sensors: int):
         super().__init__()
@@ -150,7 +153,8 @@ class GTCNN(nn.Module):
         z = torch.relu(self.filter3(z))     # [B, WINDOW*N, F]
         z = z.reshape(x.shape[0], WINDOW, self.n_sensors, -1)      # [B, T, N, F]
         z = z.permute(0, 2, 1, 3).flatten(2)                       # [B, N, T*F]
-        return self.head(z).squeeze(-1)                            # [B, N]
+        # residual on persistence: current scaled intensity (missing = 0 = sensor mean) + learned change
+        return x[:, -1, :, 0] + self.head(z).squeeze(-1)           # [B, N]
 
 
 def check_node_shared(model, S_product, x, n_sensors):
@@ -179,9 +183,11 @@ LOSSES = {"rmse": masked_rmse, "mae": masked_mae}
 
 def run_epoch(model, X, y, mask, optimizer=None):
     model.train(optimizer is not None)
+    device = next(model.parameters()).device
     total, count = 0.0, 0
     for b in range(0, len(X), BATCH_SIZE):
-        xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
+        # data stays on the CPU (too big for the GPU at WINDOW = 6), one batch at a time goes to the device
+        xb, yb, mb = (t[b:b + BATCH_SIZE].to(device) for t in (X, y, mask))
         with torch.set_grad_enabled(optimizer is not None):
             pred = model(xb)
             loss = LOSSES[LOSS](pred, yb, mb)
@@ -217,7 +223,8 @@ def main():
     assert S_product.shape == (WINDOW * n_sensors, WINDOW * n_sensors)
 
     # load data in train/val/test splits
-    data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s)) for s in ("train", "val", "test")}
+    # kept on the CPU: at WINDOW = 6 the full graph's windows are ~6.5 GB, run_epoch moves batches to the device
+    data = {s: load_split_tensors(cols, s) for s in ("train", "val", "test")}
     print("device:", device)
     print(district_label(), "with", n_sensors, "sensors")
 
@@ -236,13 +243,13 @@ def main():
     model = GTCNN(S_product.to(device), n_sensors).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model parameters: {n_params:,}")
-    check_node_shared(model, S_product.to(device), data["train"][0][:8], n_sensors) # TO:DO remove this check in the final version
+    check_node_shared(model, S_product.to(device), data["train"][0][:8].to(device), n_sensors) # TO:DO remove this check in the final version
     model = torch.compile(model) # fuses the per-node ops, measured ~1.4x on top of the fused filter
 
     # checks
     assert torch.isfinite(S).all(), "non-finite S"
     assert torch.isfinite(S_product).all(), "non-finite S_product"
-    assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
+    assert torch.isfinite(model(data["train"][0][:2].to(device))).all(), "non-finite output"
 
     # hyperparameters
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -284,7 +291,9 @@ def main():
     X_test, y, mask, targets_test = data["test"]
     model.eval()
     with torch.no_grad():
-        pred = torch.cat([model(X_test[b:b + BATCH_SIZE]) for b in range(0, len(X_test), BATCH_SIZE)])
+        pred = torch.cat([model(X_test[b:b + BATCH_SIZE].to(device)) for b in range(0, len(X_test), BATCH_SIZE)])
+    y, mask = y.to(device), mask.to(device)
+    X_now = X_test[:, -1].to(device)                          # [n, N, 7] last input step, for persistence
 
     # convert back to vehicles/hour
     pred = pred * std + mean
@@ -292,8 +301,8 @@ def main():
 
     # persistence baseline: predict the current reading (last timestep of the input window) for every target,
     # scored only where that current reading is observed (a missing one is stored as 0 = the mean)
-    now = X_test[:, -1, :, 0] * std + mean
-    mask_now = mask & (X_test[:, -1, :, 4] > 0.5)
+    now = X_now[..., 0] * std + mean
+    mask_now = mask & (X_now[..., 4] > 0.5)
 
     # overview: test error in vehicles/hour, both metrics, GTCNN vs persistence
     rows = [("GTCNN", pred, mask, "all observed targets"),

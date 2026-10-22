@@ -1,5 +1,5 @@
 # Copy of the Lab 2.3 GTCNN (graph-time CNN) applied to GO-MO Madrid traffic.
-# Takes DISTRICT intensity + occupancy + time-of-day (tod_sin, tod_cos)
+# Takes intensity (one DISTRICT, or all of them) + occupancy + time-of-day (tod_sin, tod_cos)
 # over the last WINDOW steps and predicts the intensity HORIZON steps ahead. The network
 # runs a K-tap graph filter on a Cartesian product graph over space x time, as in Lab 2.3.
 #
@@ -18,13 +18,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICT = 1              # only district 1, for faster training
+DISTRICT = None           # None = every district in the dataset (full graph), or a district number
 WINDOW = 3                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead up to 4 (1 = 15 min, 2 = 30 min, 3 = 45 min, 4 = 60 min)
 N_TAPS = 3                # graph filter order
 N_FEAT = 32                # hidden features per layer
-BATCH_SIZE = int(16384*2)
-EPOCHS = 300
+BATCH_SIZE = 256          # full graph (1054 sensors): ~5 GB peak on an 8 GB GPU; 1024+ spills to system RAM
+EPOCHS = 100
 LR = 5e-3
 LR_DECAY = 0.995          # per-epoch lr factor: 0.995^300 = 0.22, so the last epochs still learn
 PATIENCE = 30             # early stopping: stop after this many epochs without a val improvement
@@ -34,9 +34,20 @@ LOSS = "mae"             # training loss: "rmse" or "mae" (both are reported on 
 
 # ---------------------------------------------------------------- data
 
+def graph_files():
+    """Node file, edge file and node index column for DISTRICT (None = full graph)."""
+    if DISTRICT is None:
+        return "nodes.csv", "edges_full.csv", "array_index"
+    return f"nodes_district_{DISTRICT:02d}.csv", f"edges_district_{DISTRICT:02d}.csv", "local_index"
+
+
+def district_label() -> str:
+    return "all districts" if DISTRICT is None else f"district {DISTRICT}"
+
+
 def load_district_graph(n_sensors: int) -> torch.Tensor:
-    """Spatial shift operator of the district route graph, normalised D^-1/2 A D^-1/2."""
-    edges = csv.DictReader(open(DATA_DIR / "graph" / f"edges_district_{DISTRICT:02d}.csv"))
+    """Spatial shift operator of the route graph, normalised D^-1/2 A D^-1/2."""
+    edges = csv.DictReader(open(DATA_DIR / "graph" / graph_files()[1]))
     A = np.zeros((n_sensors, n_sensors), dtype=np.float32)
     for e in edges:
         i, j = int(e["target_index"]), int(e["source_index"])
@@ -47,10 +58,11 @@ def load_district_graph(n_sensors: int) -> torch.Tensor:
 
 
 def load_sensors() -> np.ndarray:
-    """Global feature column of every district-1 sensor (in local index order)."""
-    nodes = sorted(csv.DictReader(open(DATA_DIR / "graph" / f"nodes_district_{DISTRICT:02d}.csv")),
-                   key=lambda r: int(r["local_index"]))
-    return np.array([int(r["global_index"]) for r in nodes], dtype=np.int64)
+    """Global feature column of every sensor in the graph (in local index order)."""
+    node_file, _, key = graph_files()
+    nodes = sorted(csv.DictReader(open(DATA_DIR / "graph" / node_file)), key=lambda r: int(r[key]))
+    # nodes.csv indexes by array_index (= feature column), district files by global_index
+    return np.array([int(r.get("global_index", r["array_index"])) for r in nodes], dtype=np.int64)
 
 
 def load_split_tensors(cols: np.ndarray, split: str):
@@ -167,7 +179,7 @@ LOSSES = {"rmse": masked_rmse, "mae": masked_mae}
 
 def run_epoch(model, X, y, mask, optimizer=None):
     model.train(optimizer is not None)
-    total, mae_total, count = 0.0, 0.0, 0
+    total, count = 0.0, 0
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
@@ -178,9 +190,8 @@ def run_epoch(model, X, y, mask, optimizer=None):
                 loss.backward()
                 optimizer.step()
         total += loss.item() * len(xb)
-        mae_total += masked_mae(pred.detach(), yb, mb).item() * len(xb)   # metric only, LOSS stays the training loss
         count += len(xb)
-    return total / count, mae_total / count
+    return total / count
 
 
 def main():
@@ -208,7 +219,7 @@ def main():
     # load data in train/val/test splits
     data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s)) for s in ("train", "val", "test")}
     print("device:", device)
-    print("district", DISTRICT, "with", n_sensors, "sensors")
+    print(district_label(), "with", n_sensors, "sensors")
 
     # n = number of windows, N = number of sensors, 
     # 7 features per node (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos)
@@ -242,15 +253,15 @@ def main():
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
-        tr, tr_mae = run_epoch(model, *data["train"][:3], optimizer)
-        va, va_mae = run_epoch(model, *data["val"][:3])
+        tr = run_epoch(model, *data["train"][:3], optimizer)
+        va = run_epoch(model, *data["val"][:3])
         scheduler.step()
 
         # keep the weights with the lowest val loss
         if va < best_val - MIN_DELTA:
             best_val, best_epoch = va, epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        print(f"epoch {epoch:2d}  train {LOSS} {tr:.4f}  val {LOSS} {va:.4f}  val mae {va_mae:.4f}"
+        print(f"epoch {epoch:2d}  train {LOSS} {tr:.4f}  val {LOSS} {va:.4f}"
               f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
               flush=True)
 
@@ -288,7 +299,7 @@ def main():
     rows = [("GTCNN", pred, mask, "all observed targets"),
             ("GTCNN", pred, mask_now, "current reading also observed"),
             ("persistence", now, mask_now, "current reading also observed")]
-    print(f"\ntest overview ({HORIZON * 15} min ahead, district {DISTRICT}, trained on {LOSS}, vehicles/hour):")
+    print(f"\ntest overview ({HORIZON * 15} min ahead, {district_label()}, trained on {LOSS}, vehicles/hour):")
     print(f"  {'model':<12} {'RMSE':>8} {'MAE':>8} {'targets':>9}  subset")
     for name, p_, m_, subset in rows:
         print(f"  {name:<12} {masked_rmse(p_, y_phys, m_).item():8.2f} {masked_mae(p_, y_phys, m_).item():8.2f}"

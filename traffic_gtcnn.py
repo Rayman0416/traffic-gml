@@ -7,6 +7,13 @@
 #
 # Only reads data/forecast_dataset (built by `python -m preprocess.run`).
 
+"""
+test rmse/mae (30 min ahead, district 1):
+  GTCNN        rmse 111.16  mae 60.09 vehicles/hour
+  persistence  rmse 115.19  mae 64.44 vehicles/hour (predict current intensity)
+"""
+
+
 import csv
 import time
 from pathlib import Path
@@ -22,12 +29,12 @@ import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
 DISTRICT = 1              # only district 1, for faster training
-WINDOW = 6                # input window in timesteps (features.npz history_length)
+WINDOW = 5                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
-N_TAPS = 2                # graph filter order
-N_FEAT = 12                # hidden features per layer
-BATCH_SIZE = int(16384*1)
-EPOCHS = 100
+N_TAPS = 3                # graph filter order
+N_FEAT = 15                # hidden features per layer
+BATCH_SIZE = int(16384*0.5)
+EPOCHS = 60
 LR = 5e-2
 
 

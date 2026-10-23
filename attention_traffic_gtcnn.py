@@ -8,6 +8,12 @@
 # python traffic_gtcnn.py        # device=mps, batch size 32768
 #
 # Only reads data/forecast_dataset (built by `python -m preprocess.run`).
+"""
+test rmse/mae (30 min ahead, district 1):
+  GTCNN        rmse 107.74  mae 58.27 vehicles/hour
+  persistence  rmse 115.19  mae 64.44 vehicles/hour (predict current intensity)
+  figures: figures/sensor_*.png (10 sensors, last week of the test set)
+"""
 
 import csv
 import time
@@ -24,12 +30,12 @@ import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
 DISTRICT = 1              # only district 1, for faster training
-WINDOW = 6                # input window in timesteps (features.npz history_length)
+WINDOW = 4                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
 N_TAPS = 1                # graph filter order (also the attention neighbourhood, in hops)
-N_FEAT = 12               # hidden features per layer
-BATCH_SIZE = int(16384 * 1)
-EPOCHS = 50
+N_FEAT = 18               # hidden features per layer
+BATCH_SIZE = int(16384 * 0.5)
+EPOCHS = 100
 LR = 5e-2
 
 
@@ -131,8 +137,8 @@ class GraphFilter(nn.Module):
     def __init__(self, S: torch.Tensor, n_feat_in: int, n_feat_out: int):
         super().__init__()
         powers = [torch.eye(S.shape[0], dtype=S.dtype, device=S.device)]
-        for _ in range(N_TAPS):
-            powers.append(powers[0] @ S)
+        for _ in range(N_TAPS-1):
+            powers.append(powers[-1] @ S)
         self.register_buffer("powers", torch.stack(powers))       # [N_TAPS, NT, NT]
         self.weight = nn.Parameter(torch.empty(N_TAPS, n_feat_in, n_feat_out))
         self.bias = nn.Parameter(torch.zeros(n_feat_out))
@@ -156,7 +162,7 @@ class GTCNN(nn.Module):
         super().__init__()
         self.n_sensors = n_sensors
         # top-left block of the product graph is the spatial graph S (the time chain has a zero diagonal)
-        self.attn = SharedGATAttention(S[:n_sensors, :n_sensors], 4, hops=N_TAPS)
+        self.attn = SharedGATAttention(S[:n_sensors, :n_sensors], 4, hops=N_TAPS+1)
         self.filter1 = GraphFilter(S, 4, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2
         self.filter2 = GraphFilter(S, N_FEAT, N_FEAT)
         self.filter3 = GraphFilter(S, N_FEAT, N_FEAT)
@@ -239,7 +245,7 @@ def main():
     model = GTCNN(S_product.to(device), n_sensors).to(device)   # default init, seeded by manual_seed above
     n_params = sum(p.numel() for p in model.parameters())
     reach = model.attn.mask
-    print(f"  attention: {N_TAPS} hops, max neighbourhood {int(reach.sum(1).max())} of {n_sensors} sensors, "
+    print(f"  attention: {N_TAPS+1} hops, max neighbourhood {int(reach.sum(1).max())} of {n_sensors} sensors, "
           f"mask density {reach.float().mean().item():.2f}")
     assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
     print(f"  model parameters: {n_params:,}")

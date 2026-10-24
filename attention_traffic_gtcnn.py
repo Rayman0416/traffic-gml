@@ -27,17 +27,23 @@ import torch.nn.functional as F
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from functools import lru_cache
+
 
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICT = 4              # only district 1, for faster training
+DISTRICTS = [1, 4, 6]     # trained one after another, same weights; add as many as you like
+EVAL_DISTRICTS = list(range(1, 22))      # evaluated on after training: districts 1-21
+PLOT_FIGURES = True                      # False skips the 10 figures per district (210 files for 21)
+EPOCHS_PER_DISTRICT = 2
+COMPILE = True              # recompiles at every district switch (N changes); set False to compare
 WINDOW = 4                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
-C_TAPS = 3                # graph filter order (number of taps); 1 = self only
+C_TAPS = 2                # graph filter order (number of taps); 1 = self only
 A_TAPS = 1                # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
 N_FEAT = 12               # Catination later features
 HIDDEN = 12               # features after catination, these are much cheaper
-BATCH_SIZE = int(2**11)
-EPOCHS = 200
+BATCH_SIZE = int(2**10)
+EPOCHS = 100 #time to beat 337 sec
 LR = 5e-2
 DISTRICT_K = 3     # picks per window
 
@@ -46,10 +52,10 @@ DISTRICT_K = 3     # picks per window
 
 # ---------------------------------------------------------------- data
 
-def load_district_graph(n_sensors: int) -> torch.Tensor:
+def load_district_graph(n_sensors: int, district: int) -> torch.Tensor:
     """Spatial shift operator of the district route graph, normalised D^-1/2 A D^-1/2."""
     A = np.zeros((n_sensors, n_sensors), dtype=np.float32)
-    with open(DATA_DIR / "graph" / f"edges_district_{DISTRICT:02d}.csv") as f:
+    with open(DATA_DIR / "graph" / f"edges_district_{district:02d}.csv") as f:
         for e in csv.DictReader(f):
             i, j = int(e["target_index"]), int(e["source_index"])
             A[i, j] = A[j, i] = 1.0        # treat routes as undirected for influence
@@ -57,10 +63,70 @@ def load_district_graph(n_sensors: int) -> torch.Tensor:
     d_inv_sqrt = np.where(d > 0, d ** -0.5, 0.0).astype(np.float32)
     return torch.from_numpy(d_inv_sqrt[:, None] * A * d_inv_sqrt[None, :])
 
+def load_district(district, device):
+    cols = load_sensors(district)
+    S = load_district_graph(len(cols), district).to(device)
+    data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s))
+            for s in ("train", "val", "test")}
+    return cols, S, data
 
-def load_sensors() -> np.ndarray:
+
+def evaluate(model, data, cols, n_sensors, district, device):
+    p = np.load(DATA_DIR / "params.npz")
+    mean = torch.from_numpy(p["scaler_mean"][cols].astype(np.float32)).to(device)
+    std = torch.from_numpy(p["scaler_std"][cols].astype(np.float32)).to(device)
+    X_test, y, mask, targets_test = data["test"]
+    model.eval()
+    with torch.no_grad():
+        pred = torch.cat([model(X_test[b:b + BATCH_SIZE])
+                          for b in range(0, len(X_test), BATCH_SIZE)])
+    pred = pred * std + mean
+    y_phys = y * std + mean
+    rmse = torch.sqrt(masked_mse(pred, y_phys, mask)).item()
+    mae = masked_mae(pred, y_phys, mask).item()
+    now = X_test[:, -1, :, 0] * std + mean
+    rmse_persistence = torch.sqrt(masked_mse(now, y_phys, mask)).item()
+    mae_persistence = masked_mae(now, y_phys, mask).item()
+    print(f"test rmse/mae ({HORIZON * 15} min ahead, district {district}):")
+    print(f"  GTCNN        rmse {rmse:.2f}  mae {mae:.2f} vehicles/hour")
+    print(f"  persistence  rmse {rmse_persistence:.2f}  mae {mae_persistence:.2f}"
+          f" vehicles/hour (predict current intensity)")
+
+    z = np.load(DATA_DIR / "features.npz")
+    t_test = z["timestamps"][targets_test.cpu().numpy()]
+    sid_all = z["sensor_ids"]
+    order = np.argsort(t_test)
+    t_test = t_test[order]
+    pred_np = pred.cpu().numpy()[order]
+    y_np = y_phys.cpu().numpy()[order]
+    y_np[mask.cpu().numpy()[order] == 0] = np.nan
+
+    week = t_test >= t_test[-1] - np.timedelta64(7, "D")
+    t_test, pred_np, y_np = t_test[week], pred_np[week], y_np[week]
+
+    fig_dir = Path("figures")
+    fig_dir.mkdir(exist_ok=True)
+    for i in np.linspace(0, n_sensors - 1, 10).astype(int):
+        sid = sid_all[cols[i]]
+        err = np.sqrt(np.nanmean((pred_np[:, i] - y_np[:, i]) ** 2))
+        fig, ax = plt.subplots(figsize=(14, 3.5))
+        ax.plot(t_test, y_np[:, i], lw=0.8, color="steelblue", label="true")
+        ax.plot(t_test, pred_np[:, i], lw=0.8, alpha=0.85, color="darkorange",
+                label=f"predicted ({HORIZON * 15} min ahead)")
+        ax.set_title(f"sensor {sid} - last week of test, RMSE {err:.1f} vehicles/hour")
+        ax.set_ylabel("vehicles/hour")
+        ax.legend(loc="upper right")
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(fig_dir / f"sensor_{sid}_district_{district}.png", dpi=250)
+        plt.close(fig)
+    print(f"  figures: {fig_dir}/sensor_*_district_{district}.png")
+    return rmse, rmse_persistence
+
+
+def load_sensors(district: int) -> np.ndarray:
     """Global feature column of every district-1 sensor (in local index order)."""
-    with open(DATA_DIR / "graph" / f"nodes_district_{DISTRICT:02d}.csv") as f:
+    with open(DATA_DIR / "graph" / f"nodes_district_{district:02d}.csv") as f:
         nodes = sorted(csv.DictReader(f), key=lambda r: int(r["local_index"]))
     return np.array([int(r["global_index"]) for r in nodes], dtype=np.int64)
 
@@ -209,6 +275,14 @@ class GTCNN(nn.Module):
         z = torch.relu(self.fc(z))                  # <-- hidden layer + activation
         return self.head(z).squeeze(-1)                       # [B, N]
 
+    def set_graph(self, S: torch.Tensor, n_sensors: int):
+        """Swap in another district's graph. Weights are untouched; only graph buffers change."""
+        self.n_sensors = n_sensors
+        fresh = type(self.attn)(S, 4, hops=A_TAPS)               # rebuilds the attention's own buffers
+        for name, buf in fresh.named_buffers():
+            setattr(self.attn, name, buf.to(S.device))
+        for f in (self.filter1, self.fc):
+            f.S = S
 
 def check_node_shared(model, S, x, n_sensors):
     """Relabel the sensors (and the graph with them); outputs must relabel identically."""
@@ -304,99 +378,63 @@ def main():
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
-    cols = load_sensors()
-    n_sensors = len(cols)
-    S = load_district_graph(n_sensors)
+    free = lambda: torch.mps.empty_cache() if device.type == "mps" else None
 
-
-    data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s))
-            for s in ("train", "val", "test")}
-    print(f"device={device} district={DISTRICT} sensors={n_sensors} "
-          f"space-time nodes={WINDOW * n_sensors} batch size={BATCH_SIZE}")
-    for s, (X, y, *_) in data.items():
-        print(f"  {s:5s} {len(X):,} windows")
-
-    model = GTCNN(S.to(device), n_sensors).to(device)   # default init, seeded by manual_seed above
-    n_params = sum(p.numel() for p in model.parameters())
-    reach = model.attn.mask
-    print(f"  attention: {A_TAPS} hops, max neighbourhood {int(reach.sum(1).max())} of {n_sensors} sensors, "
-          f"mask density {reach.float().mean().item():.2f}")
-    assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
-    print(f"  model parameters: {n_params:,}")
-    check_node_shared(model, S.to(device), data["train"][0][:8], n_sensors)
-    district_check(S, data["train"][0])
-    district_bench(S, data["train"][0])
-    model = torch.compile(model)      # fuses the per-node ops, measured ~1.4x on top of the fused filter
+    cols, S, data = load_district(DISTRICTS[0], device)
+    model = GTCNN(S, len(cols)).to(device)          # one model for every district
+    print(f"device={device} districts={DISTRICTS} epochs/district={EPOCHS_PER_DISTRICT} "
+          f"parameters={sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    # smooth, gentle decay: lr * GAMMA^epoch (halves every ~34 epochs, ~0.13x after 100)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    current, run_model = None, model
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
+        d = DISTRICTS[((epoch - 1) // EPOCHS_PER_DISTRICT) % len(DISTRICTS)]
+        if d != current:                            # new block: one district in memory at a time
+            if current is not None:
+                data = None; free()
+                cols, S, data = load_district(d, device)
+                model.set_graph(S, len(cols))
+            check_node_shared(model, S, data["train"][0][:8], len(cols))
+            torch._dynamo.reset()                   # N changed: don't hit the recompile limit
+            run_model = torch.compile(model) if COMPILE else model
+            print(f"--- district {d}: {len(cols)} sensors, "
+                  + ", ".join(f"{s} {len(data[s][0]):,}" for s in data) + " windows")
+            current = d
         t0 = time.perf_counter()
-        tr_mse, tr_mae = run_epoch(model, *data["train"][:3], optimizer)
-        va_mse, va_mae = run_epoch(model, *data["val"][:3])
+        tr_mse, tr_mae = run_epoch(run_model, *data["train"][:3], optimizer)
+        va_mse, va_mae = run_epoch(run_model, *data["val"][:3])
         scheduler.step()
-        print(f"epoch {epoch:2d}  train mse {tr_mse:.4f} mae {tr_mae:.4f}"
+        print(f"epoch {epoch:2d} d{d:<2d} train mse {tr_mse:.4f} mae {tr_mae:.4f}"
               f"  val mse {va_mse:.4f} mae {va_mae:.4f}"
               f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
               flush=True)
     train_seconds = time.perf_counter() - train_start
-    print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, "
-          f"{train_seconds / EPOCHS:.1f}s/epoch)")
+    print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, {train_seconds / EPOCHS:.1f}s/epoch)")
 
-    # test error in vehicles per hour, undoing the per-sensor standardisation
-    p = np.load(DATA_DIR / "params.npz")
-    mean = torch.from_numpy(p["scaler_mean"][cols].astype(np.float32)).to(device)
-    std = torch.from_numpy(p["scaler_std"][cols].astype(np.float32)).to(device)
-    X_test, y, mask, targets_test = data["test"]
-    model.eval()
-    with torch.no_grad():
-        pred = torch.cat([model(X_test[b:b + BATCH_SIZE])
-                          for b in range(0, len(X_test), BATCH_SIZE)])
-    pred = pred * std + mean
-    y_phys = y * std + mean
-    rmse = torch.sqrt(masked_mse(pred, y_phys, mask)).item()
-    mae = masked_mae(pred, y_phys, mask).item()
-    now = X_test[:, -1, :, 0] * std + mean       # persistence: traffic now = traffic at horizon
-    rmse_persistence = torch.sqrt(masked_mse(now, y_phys, mask)).item()
-    mae_persistence = masked_mae(now, y_phys, mask).item()
-    print(f"test rmse/mae ({HORIZON * 15} min ahead, district {DISTRICT}):")
-    print(f"  GTCNN        rmse {rmse:.2f}  mae {mae:.2f} vehicles/hour")
-    print(f"  persistence  rmse {rmse_persistence:.2f}  mae {mae_persistence:.2f}"
-          f" vehicles/hour (predict current intensity)")
+    # final test on every district with the one set of weights, loading one at a time (eager, no compile)
+    # final test on every evaluation district with the one set of weights, one district in memory at a time
+    results = []
+    for d in EVAL_DISTRICTS:
+        data = None;
+        free()
+        try:
+            cols, S, data = load_district(d, device)
+        except FileNotFoundError as e:
+            print(f"district {d}: skipped ({e.filename} not found)")
+            continue
+        model.set_graph(S, len(cols))
+        rmse, rmse_p = evaluate(model, data, cols, len(cols), d, device)
+        results.append((d, rmse, rmse_p))
 
-    # ----------------- figures: 10 sensors, prediction vs truth, last week of the test set
-    z = np.load(DATA_DIR / "features.npz")
-    t_test = z["timestamps"][targets_test.cpu().numpy()]     # target time of each window
-    sid_all = z["sensor_ids"]
-    order = np.argsort(t_test)
-    t_test = t_test[order]
-    pred_np = pred.cpu().numpy()[order]
-    y_np = y_phys.cpu().numpy()[order]
-    y_np[mask.cpu().numpy()[order] == 0] = np.nan  # gap the truth line where target is missing
-
-    week = t_test >= t_test[-1] - np.timedelta64(7, "D")   # zoom in: last week of the test set
-    t_test, pred_np, y_np = t_test[week], pred_np[week], y_np[week]
-
-    fig_dir = Path("figures")
-    fig_dir.mkdir(exist_ok=True)
-    for i in np.linspace(0, n_sensors - 1, 10).astype(int):  # 10 sensors spread over the district
-        sid = sid_all[cols[i]]
-        err = np.sqrt(np.nanmean((pred_np[:, i] - y_np[:, i]) ** 2))
-        fig, ax = plt.subplots(figsize=(14, 3.5))
-        ax.plot(t_test, y_np[:, i], lw=0.8, color="steelblue", label="true")
-        ax.plot(t_test, pred_np[:, i], lw=0.8, alpha=0.85, color="darkorange",
-                label=f"predicted ({HORIZON * 15} min ahead)")
-        ax.set_title(f"sensor {sid} - last week of test, RMSE {err:.1f} vehicles/hour")
-        ax.set_ylabel("vehicles/hour")
-        ax.legend(loc="upper right")
-        fig.autofmt_xdate()
-        fig.tight_layout()
-        fig.savefig(fig_dir / f"sensor_{sid}_district_{DISTRICT}.png", dpi=250)
-        plt.close(fig)
-    print(f"  figures: {fig_dir}/sensor_*.png (10 sensors, last week of the test set)")
-
+    print(f"\n{'district':>8} {'trained':>8} {'GTCNN':>8} {'persist':>8} {'gain':>7}   (rmse, vehicles/hour)")
+    for d, rmse, rmse_p in results:
+        print(f"{d:8d} {'yes' if d in DISTRICTS else 'no':>8} {rmse:8.2f} {rmse_p:8.2f} {1 - rmse / rmse_p:7.1%}")
+    for label, flag in (("trained", True), ("unseen", False)):
+        g = [1 - r / rp for d, r, rp in results if (d in DISTRICTS) == flag]
+        if g:
+            print(f"mean gain over persistence, {label} districts: {sum(g) / len(g):.1%}")
 
 if __name__ == "__main__":
     main()

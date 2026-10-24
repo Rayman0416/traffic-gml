@@ -34,12 +34,15 @@ WINDOW = 4                # input window in timesteps (features.npz history_leng
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
 C_TAPS = 3                # graph filter order (number of taps); 1 = self only
 A_TAPS = 1                # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
-N_FEAT = 12               # hidden features per layer
-HIDDEN = 12
+N_FEAT = 12               # Catination later features
+HIDDEN = 12               # features after catination, these are much cheaper
 BATCH_SIZE = int(2**11)
 EPOCHS = 200
 LR = 5e-2
+DISTRICT_K = 3     # picks per window
 
+#  GTCNN        rmse 138.19  mae 69.61 vehicles/hour utan c taps
+#  GTCNN        rmse 137.33  mae 69.34 vehicles/hour med c=2
 
 # ---------------------------------------------------------------- data
 
@@ -134,6 +137,31 @@ class SharedGATAttention(nn.Module):
         out = torch.bmm(alpha, v).reshape(B, N, T, C).permute(0, 2, 1, 3)
         return x + out
 
+class DistrictGATAttention(SharedGATAttention):
+    """Dense neighbour attention plus K district picks as extra keys in the same softmax."""
+
+    def __init__(self, S_space: torch.Tensor, c: int, hops: int = A_TAPS, k: int = DISTRICT_K):
+        super().__init__(S_space, c, hops)
+        self.k = k
+        self.a_sel = nn.Linear(c, 1)                                   # importance score (5 params)
+
+    def forward(self, x):  # x: [B, T, N, C]
+        B, T, N, C = x.shape
+        h = x[:, -1]
+        s = self.a_src(h)  # [B, N, 1]
+        t = self.a_dst(h).squeeze(-1)  # [B, N]
+        u_top, pick = self.a_sel(h).squeeze(-1).topk(self.k, dim=1)  # [B, K]
+
+        picked = torch.zeros(B, N, dtype=torch.bool, device=x.device).scatter(1, pick, True)
+        gate = torch.ones(B, N, device=x.device, dtype=h.dtype).scatter(1, pick, torch.sigmoid(u_top))
+
+        keep = self.mask[None] | picked[:, None, :]  # local keys OR picked sensors
+        e = F.leaky_relu(s + t[:, None, :], 0.2).masked_fill(~keep, float("-inf"))
+        alpha = F.softmax(e, dim=-1)  # [B, N, N]
+        v = (self.v(x) * gate[:, None, :, None]).permute(0, 2, 1, 3).reshape(B, N, T * C)
+        out = torch.bmm(alpha, v).reshape(B, N, T, C).permute(0, 2, 1, 3)
+        return x + out
+
 
 class StructuredGraphFilter(nn.Module):
     """Same filter as GraphFilter, but S_product is never built:
@@ -168,7 +196,8 @@ class GTCNN(nn.Module):
     def __init__(self, S: torch.Tensor, n_sensors: int):     # S: spatial [N, N]
         super().__init__()
         self.n_sensors = n_sensors
-        self.attn = SharedGATAttention(S, 4, hops=A_TAPS)
+        #self.attn = SharedGATAttention(S, 4, hops=A_TAPS) #old way without distict node!
+        self.attn = DistrictGATAttention(S, 4, hops=A_TAPS) #New district node!
         self.filter1 = StructuredGraphFilter(S, 4, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2
         self.fc = nn.Linear(WINDOW * N_FEAT, HIDDEN)   # <-- extra hidden layer
         self.head = nn.Linear(HIDDEN, 1)             # the same head at every node
@@ -223,6 +252,50 @@ def chunked_linear(x, W, bias, chunks=512):          # x [..., K], W [F_out, K]
     out = torch.bmm(x.reshape(chunks, -1, K), W.t().unsqueeze(0).expand(chunks, -1, -1))
     return out.reshape(*x.shape[:-1], -1) + bias
 
+def district_check(S, x, tol=1e-4):
+    m = DistrictGATAttention(S, 4, hops=A_TAPS).to(x.device)
+    xb = x[:64]
+    with torch.no_grad():
+        B, T, N, C = xb.shape
+        h = xb[:, -1]
+        s, t = m.a_src(h), m.a_dst(h).squeeze(-1)
+        u_top, pick = m.a_sel(h).squeeze(-1).topk(m.k, dim=1)
+        keep = m.mask[None].expand(B, -1, -1).clone()
+        keep.scatter_(2, pick[:, None, :].expand(-1, N, -1), True)
+        alpha = F.softmax(F.leaky_relu(s + t[:, None, :], 0.2).masked_fill(~keep, float("-inf")), dim=-1)
+        gate = torch.ones(B, N, device=x.device, dtype=h.dtype)
+        for b in range(B):                                             # plain loop: obviously correct
+            gate[b, pick[b]] = torch.sigmoid(u_top[b])
+        v = (m.v(xb) * gate[:, None, :, None]).permute(0, 2, 1, 3).reshape(B, N, T * C)
+        want = xb + torch.bmm(alpha, v).reshape(B, N, T, C).permute(0, 2, 1, 3)
+        err = (m(xb) - want).abs().max().item()
+    print(f"district attention vs explicit softmax reference: max |diff| {err:.2e}")
+    assert err < tol
+
+
+def district_bench(S, x, reps=10):
+    device, xb = x.device, x[:BATCH_SIZE]
+    sync = (torch.mps.synchronize if device.type == "mps"
+            else torch.cuda.synchronize if device.type == "cuda" else (lambda: None))
+
+    def ms(mod):
+        xi = xb.clone().requires_grad_(True)
+        def run():
+            xi.grad = None
+            mod(xi).sum().backward()
+        for _ in range(3): run()
+        sync(); t0 = time.perf_counter()
+        for _ in range(reps): run()
+        sync()
+        return (time.perf_counter() - t0) / reps * 1e3
+
+    rows = [("dense_bmm", SharedGATAttention(S, 4, hops=A_TAPS))]
+    rows += [(f"district K={k}", DistrictGATAttention(S, 4, hops=A_TAPS, k=k)) for k in (3, 5)]
+    print("attention fwd+bwd [ms]        eager  compiled")
+    for name, mod in rows:
+        mod = mod.to(device)
+        print(f"  {name:16s} {ms(mod):8.1f} {ms(torch.compile(mod)):8.1f}")
+
 
 def main():
     torch.manual_seed(0)
@@ -251,11 +324,9 @@ def main():
     assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
     print(f"  model parameters: {n_params:,}")
     check_node_shared(model, S.to(device), data["train"][0][:8], n_sensors)
+    district_check(S, data["train"][0])
+    district_bench(S, data["train"][0])
     model = torch.compile(model)      # fuses the per-node ops, measured ~1.4x on top of the fused filter
-
-    #graph_report(S, model, data["train"][0], n_sensors) #remove this line later. This is just diagnostics /Calle
-    #filter_breakdown(device, n_sensors) #this too
-    #linear_variants(device, n_sensors) #this too
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # smooth, gentle decay: lr * GAMMA^epoch (halves every ~34 epochs, ~0.13x after 100)

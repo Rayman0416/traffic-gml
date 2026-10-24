@@ -29,13 +29,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICT = 1              # only district 1, for faster training
+DISTRICT = 4              # only district 1, for faster training
 WINDOW = 4                # input window in timesteps (features.npz history_length)
 HORIZON = 2               # target steps ahead (15 min per step, so 2 = 30 min)
-N_TAPS = 1                # graph filter order (also the attention neighbourhood, in hops)
-N_FEAT = 18               # hidden features per layer
-BATCH_SIZE = int(16384 * 0.5)
-EPOCHS = 100
+C_TAPS = 3                # graph filter order (number of taps); 1 = self only
+A_TAPS = 1                # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
+N_FEAT = 12               # hidden features per layer
+HIDDEN = 12
+BATCH_SIZE = int(2**11)
+EPOCHS = 200
 LR = 5e-2
 
 
@@ -112,7 +114,7 @@ class SharedGATAttention(nn.Module):
     time step and reused for every step in the window. Residual connection.
     No node-specific parameters, so it is permutation-equivariant over sensors."""
 
-    def __init__(self, S_space: torch.Tensor, c: int, hops: int = N_TAPS):
+    def __init__(self, S_space: torch.Tensor, c: int, hops: int = A_TAPS):
         super().__init__()
         N = S_space.shape[0]
         # reachability on CPU (linalg ops are patchy on MPS); the buffer moves with the model
@@ -123,71 +125,68 @@ class SharedGATAttention(nn.Module):
         self.a_dst = nn.Linear(c, 1, bias=False)
         self.v = nn.Linear(c, c)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:            # x: [B, T, N, C]
-        h = x[:, -1]                                                # [B, N, C], last step only
-        e = F.leaky_relu(self.a_src(h) + self.a_dst(h).transpose(1, 2), 0.2)   # [B, N, N], e_ij = s_i + t_j
-        e = e.masked_fill(~self.mask, float("-inf"))               # self loop => no empty rows
-        alpha = F.softmax(e, dim=-1)                                # [B, N, N]
-        return x + torch.einsum("bnm,btmc->btnc", alpha, self.v(x))
+    def forward(self, x):                                           # x: [B, T, N, C]
+        B, T, N, C = x.shape
+        h = x[:, -1]
+        e = F.leaky_relu(self.a_src(h) + self.a_dst(h).transpose(1, 2), 0.2)
+        alpha = F.softmax(e.masked_fill(~self.mask, float("-inf")), dim=-1)    # [B, N, N]
+        v = self.v(x).permute(0, 2, 1, 3).reshape(B, N, T * C)      # [B, N, T*C]
+        out = torch.bmm(alpha, v).reshape(B, N, T, C).permute(0, 2, 1, 3)
+        return x + out
 
 
-class GraphFilter(nn.Module):
-    """One LSIGF layer from the GTCNN: y = sum_k S^k x W_k + b."""
+class StructuredGraphFilter(nn.Module):
+    """Same filter as GraphFilter, but S_product is never built:
+    (I⊗S + S_time⊗I) x  =  S x_t + x_{t-1}   (per slice, plus a time shift)."""
 
-    def __init__(self, S: torch.Tensor, n_feat_in: int, n_feat_out: int):
+    def __init__(self, S_space: torch.Tensor, n_in: int, n_out: int):
         super().__init__()
-        powers = [torch.eye(S.shape[0], dtype=S.dtype, device=S.device)]
-        for _ in range(N_TAPS-1):
-            powers.append(powers[-1] @ S)
-        self.register_buffer("powers", torch.stack(powers))       # [N_TAPS, NT, NT]
-        self.weight = nn.Parameter(torch.empty(N_TAPS, n_feat_in, n_feat_out))
-        self.bias = nn.Parameter(torch.zeros(n_feat_out))
+        self.register_buffer("S", S_space)                       # [N, N]
+        self.weight = nn.Parameter(torch.empty(C_TAPS, n_in, n_out))
+        self.bias = nn.Parameter(torch.zeros(n_out))
         nn.init.xavier_uniform_(self.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:            # x: [B, NT, F_in]
-        taps = [x]                                    # S^0 x = x, no multiply needed
-        for k in range(1, N_TAPS):
-            taps.append(torch.einsum("nm,bmf->bnf", self.powers[k], x))
-        # all taps in one contraction: y = sum_k S^k x W_k + b (fewer MPS kernel launches)
+    def product_step(self, x):                                   # x: [B, T, N, F]
+        B, T, N, Fd = x.shape
+        xs = x.permute(2, 0, 1, 3).reshape(N, -1)                # [N, B*T*F]
+        spatial = (self.S @ xs).reshape(N, B, T, Fd).permute(1, 2, 0, 3)
+        past = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return spatial + past
+
+    def forward(self, x):                                        # [B, T, N, F_in]
+        taps = [x]
+        for _ in range(1, C_TAPS):
+            taps.append(self.product_step(taps[-1]))             # S_product^k x, iteratively
         W = self.weight.permute(2, 0, 1).reshape(self.weight.shape[2], -1)
-        return nn.functional.linear(torch.cat(taps, dim=-1), W) + self.bias
+        return chunked_linear(torch.cat(taps, dim=-1), W, self.bias)
 
 
 class GTCNN(nn.Module):
-    """Spatial attention, then three product-graph filter layers and one shared head.
-    Every node runs the exact same network with the same weights: shared attention and
-    filters (neighbour mixing) plus the same per-node readout. No node-private parameters."""
+    """Spatial attention, then three space-time filter layers and one shared head.
+    Every node runs the exact same network with the same weights."""
 
-    def __init__(self, S: torch.Tensor, n_sensors: int):
+    def __init__(self, S: torch.Tensor, n_sensors: int):     # S: spatial [N, N]
         super().__init__()
         self.n_sensors = n_sensors
-        # top-left block of the product graph is the spatial graph S (the time chain has a zero diagonal)
-        self.attn = SharedGATAttention(S[:n_sensors, :n_sensors], 4, hops=N_TAPS+1)
-        self.filter1 = GraphFilter(S, 4, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2
-        self.filter2 = GraphFilter(S, N_FEAT, N_FEAT)
-        self.filter3 = GraphFilter(S, N_FEAT, N_FEAT)
-        self.head = nn.Linear(WINDOW * N_FEAT, 1)      # the same head at every node
+        self.attn = SharedGATAttention(S, 4, hops=A_TAPS)
+        self.filter1 = StructuredGraphFilter(S, 4, N_FEAT)   # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2
+        self.fc = nn.Linear(WINDOW * N_FEAT, HIDDEN)   # <-- extra hidden layer
+        self.head = nn.Linear(HIDDEN, 1)             # the same head at every node
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 4]
-        x = self.attn(x)                                           # [B, WINDOW, N, 4]
-        z = x.reshape(x.shape[0], -1, x.shape[-1])                 # [B, WINDOW*N, C]
-        z = torch.relu(self.filter1(z))
-        z = torch.relu(self.filter2(z))
-        z = torch.relu(self.filter3(z))                            # [B, WINDOW*N, F]
-        z = z.reshape(x.shape[0], WINDOW, self.n_sensors, -1)      # [B, T, N, F]
-        z = z.permute(0, 2, 1, 3).flatten(2)                       # [B, N, T*F]
-        return self.head(z).squeeze(-1)                            # [B, N]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:      # x: [B, WINDOW, N, 4]
+        x = self.attn(x)                                      # [B, T, N, 4]
+        z = torch.relu(self.filter1(x))                       # [B, T, N, F]
+        z = z.permute(0, 2, 1, 3).flatten(2)                  # [B, N, T*F]
+        z = torch.relu(self.fc(z))                  # <-- hidden layer + activation
+        return self.head(z).squeeze(-1)                       # [B, N]
 
 
-def check_node_shared(model, S_product, x, n_sensors):
-    """Check that every node runs the exact same network: relabel the sensors (and the
-    graph with them) and the outputs must relabel identically."""
+def check_node_shared(model, S, x, n_sensors):
+    """Relabel the sensors (and the graph with them); outputs must relabel identically."""
     pi = torch.randperm(n_sensors, device=x.device)
-    idx = (torch.arange(WINDOW, device=x.device)[:, None] * n_sensors + pi).flatten()
-    twin = GTCNN(S_product[idx][:, idx], n_sensors).to(x.device)
+    twin = GTCNN(S[pi][:, pi], n_sensors).to(x.device)
     for a, b in zip(twin.parameters(), model.parameters()):
         a.data.copy_(b.data)
-    # atol 1e-4: softmax and the reordered sums differ by float32 rounding
     assert torch.allclose(model(x)[:, pi], twin(x[:, :, pi]), atol=1e-4), "node sharing violated"
 
 
@@ -203,7 +202,7 @@ def masked_mae(pred, y, mask):
 
 def run_epoch(model, X, y, mask, optimizer=None):
     model.train(optimizer is not None)
-    total, mae_total, count = 0.0, 0.0, 0
+
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
@@ -213,10 +212,16 @@ def run_epoch(model, X, y, mask, optimizer=None):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-        total += loss.item() * len(xb)
-        mae_total += masked_mae(pred.detach(), yb, mb).item() * len(xb)   # metric only, MSE stays the loss
-        count += len(xb)
-    return total / count, mae_total / count
+
+    # Zero syncs or accumulation in the loop. Return the raw tensors from the LAST batch.
+    return loss.detach(), masked_mae(pred.detach(), yb, mb)
+
+def chunked_linear(x, W, bias, chunks=512):          # x [..., K], W [F_out, K]
+    K = x.shape[-1]
+    if (x.numel() // K) % chunks:
+        return F.linear(x, W) + bias
+    out = torch.bmm(x.reshape(chunks, -1, K), W.t().unsqueeze(0).expand(chunks, -1, -1))
+    return out.reshape(*x.shape[:-1], -1) + bias
 
 
 def main():
@@ -230,10 +235,6 @@ def main():
     n_sensors = len(cols)
     S = load_district_graph(n_sensors)
 
-    # Cartesian product graph over space x time (Lab 2.3: s01 = s10 = 1, s00 = s11 = 0)
-    S_time = torch.diag(torch.ones(WINDOW - 1), -1)                # past -> present chain
-    S_product = torch.kron(torch.eye(WINDOW), S) + torch.kron(S_time, torch.eye(n_sensors))
-    assert S_product.shape == (WINDOW * n_sensors, WINDOW * n_sensors)
 
     data = {s: tuple(t.to(device) for t in load_split_tensors(cols, s))
             for s in ("train", "val", "test")}
@@ -242,15 +243,19 @@ def main():
     for s, (X, y, *_) in data.items():
         print(f"  {s:5s} {len(X):,} windows")
 
-    model = GTCNN(S_product.to(device), n_sensors).to(device)   # default init, seeded by manual_seed above
+    model = GTCNN(S.to(device), n_sensors).to(device)   # default init, seeded by manual_seed above
     n_params = sum(p.numel() for p in model.parameters())
     reach = model.attn.mask
-    print(f"  attention: {N_TAPS+1} hops, max neighbourhood {int(reach.sum(1).max())} of {n_sensors} sensors, "
+    print(f"  attention: {A_TAPS} hops, max neighbourhood {int(reach.sum(1).max())} of {n_sensors} sensors, "
           f"mask density {reach.float().mean().item():.2f}")
     assert torch.isfinite(model(data["train"][0][:2])).all(), "non-finite output"
     print(f"  model parameters: {n_params:,}")
-    check_node_shared(model, S_product.to(device), data["train"][0][:8], n_sensors)
+    check_node_shared(model, S.to(device), data["train"][0][:8], n_sensors)
     model = torch.compile(model)      # fuses the per-node ops, measured ~1.4x on top of the fused filter
+
+    #graph_report(S, model, data["train"][0], n_sensors) #remove this line later. This is just diagnostics /Calle
+    #filter_breakdown(device, n_sensors) #this too
+    #linear_variants(device, n_sensors) #this too
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # smooth, gentle decay: lr * GAMMA^epoch (halves every ~34 epochs, ~0.13x after 100)
@@ -317,7 +322,7 @@ def main():
         ax.legend(loc="upper right")
         fig.autofmt_xdate()
         fig.tight_layout()
-        fig.savefig(fig_dir / f"sensor_{sid}.png", dpi=250)
+        fig.savefig(fig_dir / f"sensor_{sid}_district_{DISTRICT}.png", dpi=250)
         plt.close(fig)
     print(f"  figures: {fig_dir}/sensor_*.png (10 sensors, last week of the test set)")
 

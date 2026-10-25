@@ -97,7 +97,13 @@ MADRID_CENTRE = (40.4168, -3.7038)  # Puerta del Sol (lat, lon)
 
 # Zero is treated as potentially valid traffic and is never rejected but negative values are.
 REJECT_NEGATIVE = True
-HARD_CAP_VEH_PER_HOUR = 20000.0   # far above any plausible urban 15-min rate
+HARD_CAP_VEH_PER_HOUR = 8500   # far above any plausible urban 15-min rate
+#Calle - i did manualy check the dataset. We should maybe look more into the pre processed data
+SPIKE_FACTOR = 5.0
+SPIKE_MIN_PREV_VEH_PER_HOUR = 700
+# this may need to be checked. I am unsure if this is a good value.
+# This means that we will not apply the spiking tule if the prev is below this value.
+# So with 700 the spike can be 700 -> 3500 and be fine. But not more than that
 
 # Occupancy is an integer percentage; anything outside [0, 100] is impossible.
 OCCUPANCY_MIN_PERCENT = 0.0
@@ -160,6 +166,7 @@ class Flag:
     DUPLICATE_RESOLVED = 1 << 8      # duplicates agreed and were collapsed
     OCCUPANCY_NON_NUMERIC = 1 << 9   # occupancy present but not a finite number
     OCCUPANCY_OUT_OF_RANGE = 1 << 10  # occupancy outside [0, 100] percent
+    INTENSITY_SPIKE = 1 << 11         # > SPIKE_FACTOR × previous accepted value
 
     # GO-MO's interpolated values are accepted for now, but might have to be filled in manually in the future
     # to prevent test leakage
@@ -172,6 +179,7 @@ class Flag:
         | DUPLICATE_CONFLICT
         | NEGATIVE
         | ABOVE_HARD_CAP
+        | INTENSITY_SPIKE
     )
 
     # Occupancy rejecting flags
@@ -195,6 +203,7 @@ class Flag:
         DUPLICATE_RESOLVED: "duplicate_resolved",
         OCCUPANCY_NON_NUMERIC: "occupancy_non_numeric",
         OCCUPANCY_OUT_OF_RANGE: "occupancy_out_of_range",
+        INTENSITY_SPIKE: "intensity_spike",
     }
 
     @classmethod

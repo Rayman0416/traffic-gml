@@ -1,41 +1,52 @@
 import torch 
 import torch.nn as nn
-from preprocess import features, windows
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
+import pandas as pd
 
-# --------------------------------
-# THIS IS THE SENSOR WE ARE PREDICTING FOR
+data_dir = "data/forecast_dataset"
+
 sensor_idx = 30
-# --------------------------------
 
-nbr_sensors = 500
 nbr_timestamps = 6
-epochs = 50
-batch_size = 64
+epochs = 10
+batch_size = 1000
 learning_rate = 0.001
-nbr_iterations = 10 # just to start 
+horizons = {"h1": 15, "h2": 30, "h3": 45, "h4": 60}
 
-f = features.load()
-win = windows.load()
+features = np.load(f"{data_dir}/features.npz")
+params = np.load(f"{data_dir}/params.npz")
+windows = pd.read_csv(f"{data_dir}/windows.csv")
 
-train_origins = win.loc[win["split"] == "train", "origin_index"].to_numpy()
-eval_origins = win.loc[win["split"] == "val", "origin_index"].to_numpy()
+intensity = features["intensity"]        # [T, N] standardised per sensor
+mask = features["intensity_mask"]        # [T, N] True where genuinely observed
 
-train_data = features.window_features(f, train_origins)
-eval_data = features.window_features(f, eval_origins)
+intensity = np.where(mask, intensity, np.nan) 
 
-data = features.window_features(f, train_origins)
+timestamps = pd.DatetimeIndex(features["timestamps"])
+mean = params["scaler_mean"]
+std = params["scaler_std"][sensor_idx]
 
-nbr_features = 1 + 1 + 1 + nbr_timestamps 
+slot = timestamps.hour.to_numpy() * 4 + timestamps.minute.to_numpy() // 15
+time_of_week = timestamps.dayofweek.to_numpy() * 96 + slot   # weekday x 15-min slot, 0..671
+
+history_steps = np.arange(-5, 1)   # the 6 input steps up to and including the origin
+
+def history_rows(origins):
+    # standardised intensity over the 6-step input window: [windows, 6, N], gaps -> 0
+    return np.nan_to_num(intensity[origins[:, None] + history_steps[None, :]])
+
+train_origins = windows.loc[windows["split"] == "train", "origin_index"].to_numpy()
+test_origins = windows.loc[windows["split"] == "test", "origin_index"].to_numpy()
+
+nbr_features = 1 + 1 + nbr_timestamps 
 
 class TrafficNetwork(nn.Module):
-
     def __init__(self):
         super().__init__()
-
+        self.time_emb = nn.Embedding(672, 8)
         self.layers = nn.Sequential(
-            nn.Linear(nbr_features, 32),
+            nn.Linear(nbr_features + 7, 32),
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
@@ -43,39 +54,25 @@ class TrafficNetwork(nn.Module):
         )
 
     def forward(self, x):
-        return self.layers(x)
+        t = self.time_emb(x[:, -1].long())              
+        return self.layers(torch.cat([x[:, :-1], t], dim=1))
 
 
-def _create_input(data, origins):
-    intensity = data["intensity"][:, -1, sensor_idx]
-    occupancy = data["occupancy"][:, -1, sensor_idx]
-    time_sin = data["time_features"][:, 0]
-    history = data["intensity"][:, -nbr_timestamps:, sensor_idx]
+def _create_input(origins):
+    steps = origins[:, None] + np.arange(-(nbr_timestamps - 1), 1)[None, :] 
+    history = np.where(mask[steps, sensor_idx], intensity[steps, sensor_idx], 0.0)
 
-    X = np.column_stack([
-        intensity,
-        occupancy,
-        time_sin,
-        history,
-    ])
+    X = np.column_stack([history[:, -1], history, time_of_week[origins + 1]])
+    y = intensity[origins + 1, sensor_idx]
 
-    # the target time
-    y = f["intensity"][origins + 1, sensor_idx]
-    # remove missing observations
-    valid = f["intensity_mask"][origins + 1, sensor_idx].astype(bool)
-    valid &= data["intensity_mask"][:, -nbr_timestamps:, sensor_idx].all(axis=1)
-    valid &= data["occupancy_mask"][:, -1, sensor_idx].astype(bool)
-    X = X[valid]
-    y = y[valid]
+    measured = mask[origins + 1, sensor_idx]        
+    X, y = X[measured], y[measured]
 
-    return (
-        torch.tensor(X, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.float32).unsqueeze(1),
-    )
+    return (torch.tensor(X, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32).unsqueeze(1))
 
-
-X_train, y_train = _create_input(train_data, train_origins)
-X_eval, y_eval = _create_input(eval_data, eval_origins)
+X_train, y_train = _create_input(train_origins)
+X_eval, y_eval = _create_input(test_origins)
 
 train_dataset = TensorDataset(X_train, y_train)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -121,5 +118,5 @@ with torch.no_grad():
     eval_mae = nn.functional.l1_loss(predictions, y_eval).item()
 
 print(f"\nEvaluation results for sensor {sensor_idx}:")
-print(f"MSE: {eval_mse:.4f}")
-print(f"MAE: {eval_mae:.4f}")
+print(f"MAE:  {eval_mae * std:.1f} veh/h")
+print(f"RMSE: {(eval_mse ** 0.5) * std:.1f} veh/h")

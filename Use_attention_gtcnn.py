@@ -4,7 +4,7 @@ import torch
 
 
 m.DATA_DIR = Path("data/forecast_dataset")
-CKPT = "checkpoints/gtcnn_post_20261025_1813.pt"
+CKPT = "checkpoints/gtcnn_20261025_1526.pt"
 trained = torch.load(CKPT, map_location="cpu", weights_only=True)["trained_districts"]
 m.shared_data.cache_clear()          # otherwise the old folder's arrays are still served
 

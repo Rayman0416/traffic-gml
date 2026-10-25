@@ -34,9 +34,17 @@ def history_rows(origins):
     # standardised intensity over the 6-step input window: [windows, 6, N], gaps -> 0
     return np.nan_to_num(intensity[origins[:, None] + history_steps[None, :]])
 
-train_origins = windows.loc[windows["split"] == "train", "origin_index"].to_numpy()
-train_origins = train_origins[::10]       # train only every 10th window to make it quicker
-test_origins = windows.loc[windows["split"] == "test", "origin_index"].to_numpy()
+target_indexes = [f"target_index_{h}" for h in horizons]   
+
+train_w = windows[windows["split"] == "train"]
+test_w = windows[windows["split"] == "test"]
+
+train_origins = train_w["origin_index"].to_numpy()
+train_targets = train_w[target_indexes].to_numpy()      
+train_origins, train_targets = train_origins[::10], train_targets[::10]  # train only every 10th window to make it quicker
+
+test_origins = test_w["origin_index"].to_numpy()
+test_targets = test_w[target_indexes].to_numpy()
 
 nbr_features = 1 + 1 + nbr_timestamps 
 
@@ -49,7 +57,7 @@ class TrafficNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
-            nn.Linear(16, 1) 
+            nn.Linear(16, 4) # outputs one prediction per horizon
         )
 
     def forward(self, x):
@@ -57,28 +65,36 @@ class TrafficNetwork(nn.Module):
         return self.layers(torch.cat([x[:, :-1], t], dim=1))
 
 
-def _create_input(origins):
+def _create_input(origins, targets):
     steps = origins[:, None] + np.arange(-(nbr_timestamps - 1), 1)[None, :] 
     history = np.where(mask[steps], intensity[steps], 0.0).transpose(0,2,1)
 
-    tow = np.repeat(time_of_week[origins + 1][:, None], nbr_sensors, axis=1)   
-    X = np.concatenate([history[:, :, -1:], history, tow[:, :, None]], axis=2)     
-    y = intensity[origins + 1]
-    measured = mask[origins + 1]        
-    stds = np.broadcast_to(std[None, :], measured.shape) 
+    tow = np.repeat(time_of_week[origins][:, None], nbr_sensors, axis=1)   
 
-    X, y, stds = X[measured], y[measured], stds[measured]
+    X = np.concatenate([history[:, :, -1:], history, tow[:, :, None]], axis=2)     
+    y = np.stack([intensity[targets[:, k]] for k in range(len(horizons))], axis=2) 
+    measured = np.stack([mask[targets[:, k]] for k in range(len(horizons))], axis=2)   
+    stds = np.broadcast_to(std[None, :], measured.shape[:2]) 
+
+    y = np.where(measured, y, 0.0)
+
+    keep = measured.any(axis=2)  
+    X, y, measured, stds = X[keep], y[keep], measured[keep], stds[keep]
 
     return (torch.tensor(X, dtype=torch.float32),
-            torch.tensor(y, dtype=torch.float32).unsqueeze(1),
+            torch.tensor(y, dtype=torch.float32),
+            torch.tensor(measured, dtype=torch.float32),
             torch.tensor(stds, dtype=torch.float32).unsqueeze(1))
 
-X_train, y_train, std_train = _create_input(train_origins)
-X_eval, y_eval, std_eval = _create_input(test_origins)
+X_train, y_train, measured_train, std_train = _create_input(train_origins, train_targets)  
+X_eval, y_eval, measured_eval, std_eval = _create_input(test_origins, test_targets)
+
+def loss_fn(pred, y, measured):
+    return ((pred - y).abs() * measured).sum() / measured.sum().clamp(min=1.0)
 
 model = TrafficNetwork()
-loss_fn = nn.L1Loss()  # MAE
 opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
 
 n_train = len(X_train)
 
@@ -86,36 +102,36 @@ for epoch in range(epochs):
     model.train()
     total_mae = 0.0
     total_mse = 0.0
+    total_n = 0.0
     order = torch.randperm(n_train)                     
 
     for i in range(0, n_train, batch_size):
         idx = order[i:i + batch_size]
-        X_batch, y_batch = X_train[idx], y_train[idx]
+        X_batch, y_batch, measured_batch = X_train[idx], y_train[idx], measured_train[idx]
 
         opt.zero_grad()
         predictions = model(X_batch)
-        loss = loss_fn(predictions, y_batch)
+        loss = loss_fn(predictions, y_batch, measured_batch)
         loss.backward()
         opt.step()
 
         errors = predictions - y_batch
-        total_mae += torch.abs(errors).sum().item()
-        total_mse += (errors ** 2).sum().item()
+        total_mae += (errors.abs() * measured_batch).sum().item()
+        total_mse += ((errors ** 2) * measured_batch).sum().item()
+        total_n += measured_batch.sum().item()
 
-    average_mae = total_mae / n_train
-    average_mse = total_mse / n_train
-    print(f"Epoch {epoch + 1}/{epochs}, Training MAE: {average_mae:.4f}, training MSE: {average_mse:.4f}")
+    print(f"Epoch {epoch + 1}/{epochs}, "
+          f"Training MAE: {total_mae / total_n:.4f}, training MSE: {total_mse / total_n:.4f}")
 
 
 model.eval()
-
 with torch.no_grad():
     predictions = model(X_eval)
 
 err = (predictions - y_eval) * std_eval        
-eval_mae = err.abs().mean().item()
-eval_rmse = (err ** 2).mean().sqrt().item()
 
-print(f"\nEvaluation results for {nbr_sensors} sensors (15 min ahead, test):")
-print(f"MAE:  {eval_mae:.1f} veh/h")    
-print(f"RMSE: {eval_rmse:.1f} veh/h")
+print(f"\nEvaluation results for {nbr_sensors} sensors (test):")
+for k, minutes in enumerate(horizons.values()):
+    e = err[:, k][measured_eval[:, k].bool()]             
+    print(f"{minutes} min:  MAE {e.abs().mean().item():.1f}  "
+          f"RMSE {e.pow(2).mean().sqrt().item():.1f} veh/h   (n = {len(e)})")

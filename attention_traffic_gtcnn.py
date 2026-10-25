@@ -8,23 +8,25 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import datetime
+
 matplotlib.use("Agg")
 
 """
 Hyper-Perameters with explination
 """
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICTS = [4, 6, 10, 3, 14, 13]  # 1, 4, 6 is a good mix? maybe add 10
-PLOT_FIGURES = False  # False skips the 10 figures per district, good for debug
+DISTRICTS = [4, 6, 10, 3, 13]  # 1, 4, 6 is a good mix? maybe add 10
+PLOT_FIGURES = True  # False skips the 10 figures per district, good for debug
 EPOCHS_PER_DISTRICT = 25 # Try not to make this too low. Swapping wastes time
-WINDOW = 6  # input window in timesteps (features.npz history_length). Does what you think it does
+WINDOW = 4  # input window in timesteps (features.npz history_length). Does what you think it does
 C_TAPS = 2  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
 N_FEAT = 12  # features before concat and graph filter. 8-12 is good
 HIDDEN = 12  # features after concat, these are much cheaper. Maybe we add some extra layers here?
-DISTRICT_K = 3  # District node picks this many nodes using attention
+DISTRICT_K = 5  # District node picks this many nodes using attention
 
-EPOCHS = 500        # well, you know what this is :)
+EPOCHS = 400       # well, you know what this is :)
 LR = 5e-2           # learning rate
 Gamma_LR = 0.992    # LR = LR * Gamma_LR ** epochs
 
@@ -60,6 +62,38 @@ def load_district(district,
             for s in ("train", "val", "test")}
     print(f"  loaded district {district} in {time.perf_counter() - t0:.1f}s")
     return cols, S, data
+
+def save_checkpoint(model, path, trained_districts):
+    ckpt = dict(
+        format=1,
+        state_dict={k: v.detach().cpu() for k, v in model.named_parameters()},   # shared weights only
+        config=dict(WINDOW=WINDOW, HORIZON=HORIZON, C_TAPS=C_TAPS, A_TAPS=A_TAPS, N_FEAT=N_FEAT,
+                    attn=type(model.attn).__name__, k=getattr(model.attn, "k", None)),
+        input_channels=["intensity", "occupancy", "tod_sin", "day_sin2"],   # last axis of X, in order
+        trained_districts=list(trained_districts),
+        epochs=EPOCHS, epochs_per_district=EPOCHS_PER_DISTRICT,
+        torch=str(torch.__version__),                    # str(): the raw version object can't be loaded safely
+        saved=datetime.datetime.now().isoformat(timespec="seconds"),
+    )
+    torch.save(ckpt, path)
+
+
+def load_trained(path, district, device="cpu"):
+    """Checkpoint -> model with `district`'s graph set. Returns model, cols, S, data."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)     # plain tensors/dicts only: safe to load
+    cfg = ckpt["config"]
+    mine = dict(WINDOW=WINDOW, HORIZON=HORIZON, C_TAPS=C_TAPS, A_TAPS=A_TAPS, N_FEAT=N_FEAT)
+    bad = {k: (cfg[k], mine[k]) for k in mine if cfg[k] != mine[k]}
+    assert not bad, f"constants differ from the checkpoint (checkpoint, this file): {bad}"
+    device = torch.device(device)
+    cols, S, data = load_district(district, device)
+    model = GTCNN(S, len(cols)).to(device)
+    assert type(model.attn).__name__ == cfg["attn"] and getattr(model.attn, "k", None) == cfg["k"], \
+        f"architecture differs: checkpoint has {cfg['attn']} k={cfg['k']}"
+    missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)   # buffers are 'missing' by design
+    params = {k for k, _ in model.named_parameters()}
+    assert not unexpected and not (set(missing) & params), f"weights do not match: {missing} {unexpected}"
+    return model.eval(), cols, S, data
 
 
 @lru_cache(maxsize=1)
@@ -259,13 +293,16 @@ class GTCNN(nn.Module):
         self.attn = DistrictGATAttention(S, 4, hops=A_TAPS)  # New district node!
         self.filter1 = StructuredGraphFilter(S, 4, N_FEAT)  # channels: intensity, occupancy, tod_sin, sin(pi*t/96)^2
         self.fc = nn.Linear(WINDOW * N_FEAT, HIDDEN)  # <-- extra hidden layer
+        self.fc2 = nn.Linear(HIDDEN, HIDDEN)  # <-- extra hidden layer
         self.head = nn.Linear(HIDDEN, 1)  # the same head at every node
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, WINDOW, N, 4]
         x = self.attn(x)  # [B, T, N, 4]
         z = torch.relu(self.filter1(x))  # [B, T, N, F]
+        #z = torch.square(self.filter1(x)) #todo try this
         z = z.permute(0, 2, 1, 3).flatten(2)  # [B, N, T*F]
         z = torch.relu(self.fc(z))  # <-- hidden layer + activation
+        z = torch.relu(self.fc2(z))
         return self.head(z).squeeze(-1)  # [B, N]
 
     def set_graph(self, S: torch.Tensor, n_sensors: int):
@@ -274,7 +311,7 @@ class GTCNN(nn.Module):
         fresh = type(self.attn)(S, 4, hops=A_TAPS)  # rebuilds the attention's own buffers
         for name, buf in fresh.named_buffers():
             setattr(self.attn, name, buf.to(S.device))
-        for f in (self.filter1, self.fc):
+        for f in (self.filter1, self.fc, self.fc2):
             f.S = S
 
 
@@ -402,6 +439,19 @@ def main():
               flush=True)
     train_seconds = time.perf_counter() - train_start
     print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, {train_seconds / EPOCHS:.1f}s/epoch)")
+
+    #Saving the model!
+    tag = time.strftime("%Y%m%d_%H%M")
+    Path("checkpoints").mkdir(exist_ok=True)
+    ckpt_path = f"checkpoints/gtcnn_{tag}.pt"
+    save_checkpoint(model, ckpt_path, DISTRICTS)
+    reloaded, *_ = load_trained(ckpt_path, current, device)  # round-trip check on the current district
+    model.eval()
+    with torch.no_grad():
+        x = data["train"][0][:8]
+        assert torch.allclose(model(x), reloaded(x), atol=1e-6), "checkpoint round-trip mismatch"
+    print(f"saved {ckpt_path}")
+
 
     # final test on every district with the one set of weights, loading one at a time (eager, no compile)
     # final test on every evaluation district with the one set of weights, one district in memory at a time

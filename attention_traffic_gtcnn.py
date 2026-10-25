@@ -16,9 +16,8 @@ matplotlib.use("Agg")
 Hyper-Perameters with explination
 """
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICTS = [4, 6, 10, 3, 13]  # 1, 4, 6 is a good mix? maybe add 10
-PLOT_FIGURES = True  # False skips the 10 figures per district, good for debug
-EPOCHS_PER_DISTRICT = 25 # Try not to make this too low. Swapping wastes time
+DISTRICTS = [4, 2, 14, 4, 6]  #: 4, 2, 14, 4, 6
+EPOCHS_PER_DISTRICT = 50 # Try not to make this too low. Swapping wastes time
 WINDOW = 4  # input window in timesteps (features.npz history_length). Does what you think it does
 C_TAPS = 2  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
@@ -26,9 +25,9 @@ N_FEAT = 12  # features before concat and graph filter. 8-12 is good
 HIDDEN = 12  # features after concat, these are much cheaper. Maybe we add some extra layers here?
 DISTRICT_K = 5  # District node picks this many nodes using attention
 
-EPOCHS = 400       # well, you know what this is :)
+EPOCHS = 3000       # well, you know what this is :)
 LR = 5e-2           # learning rate
-Gamma_LR = 0.992    # LR = LR * Gamma_LR ** epochs
+Gamma_LR = 0.9975    # LR = LR * Gamma_LR ** epochs
 
 """
 Less hyper perameters probalby do not change
@@ -37,7 +36,7 @@ EVAL_DISTRICTS = list(range(1, 22))  # evaluated on after training: districts 1-
 COMPILE = True  # recompiles at every district switch (N changes)
 HORIZON = 2  # How many timesteps ahead to predict. 2 = 30 min
 BATCH_SIZE = int(2 ** 10) # How to batch
-
+PLOT_FIGURES = False  # False skips the 10 figures per district, good for debug
 
 # ---------------------------------------------------------------- data
 
@@ -472,10 +471,6 @@ def main():
     for d, rmse, rmse_p, mae in results:
         print(
             f"{d:8d} {'yes' if d in DISTRICTS else 'no':>8} {rmse:8.2f} {rmse_p:8.2f} {1 - rmse / rmse_p:7.1%} {mae:8.2f}")
-    for label, flag in (("trained", True), ("unseen", False)):
-        g = [1 - r / rp for d, r, rp in results if (d in DISTRICTS) == flag]
-        if g:
-            print(f"mean gain over persistence, {label} districts: {sum(g) / len(g):.1%}")
 
 
 if __name__ == "__main__":

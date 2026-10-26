@@ -13,10 +13,17 @@ import datetime
 
 matplotlib.use("Agg")
 
-# python attention_traffic_gtcnn.py                      # GTCNN + district attention, seed 0
-# python attention_traffic_gtcnn.py --attn shared        # ablation: neighbour attention only
-# python attention_traffic_gtcnn.py --attn none          # ablation: plain GTCNN, no attention
-# python attention_traffic_gtcnn.py --seed 1             # run seeds 0, 1, 2 for mean +- std
+# Every district runs the same local GTCNN. Each district then sums itself up in one token, and every
+# district reads the K most useful tokens of the other districts (TOKEN_MODEL_PLAN.md).
+#
+# python attention_traffic_gtcnn.py                                # aware router, K=2 (our model)
+# python attention_traffic_gtcnn.py --router traffic               # router without the support descriptor
+# python attention_traffic_gtcnn.py --k 0                          # partitioned, no exchange
+# python attention_traffic_gtcnn.py --partition none               # full city as one graph (K=0)
+# python attention_traffic_gtcnn.py --k 0 --attn none              # plain GTCNN baseline
+# python attention_traffic_gtcnn.py --gate off / --prior / --exchange full   # ablations
+# python attention_traffic_gtcnn.py --seed 1                       # run seeds 0, 1, 2 for mean +- std
+# python attention_traffic_gtcnn.py --data-dir data/forecast_dataset_full    # 21 districts, 4,143 sensors
 
 """
 Hyper-Perameters with explination
@@ -28,26 +35,29 @@ HORIZONS = (1, 2, 3, 4)  # predicted at once: 15, 30, 45, 60 min ahead
 C_TAPS = 3  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
 N_FEAT = 32  # features before concat and graph filter. 8-12 is good
-HIDDEN = 64  # features after concat, these are much cheaper. Maybe we add some extra layers here?
+HIDDEN = 64  # features after concat, these are much cheaper. Also the size of a district token
 DISTRICT_K = 5  # District node picks this many nodes using attention
-ATTN = "district"  # "district", "shared" (neighbours only) or "none" (plain GTCNN). --attn on the command line
+ATTN = "district"  # local attention: "district", "shared" (neighbours only) or "none". --attn on the command line
+K = 2  # other-district tokens each district reads; 0 = partitioned, no exchange. --k
+ROUTER = "aware"  # "aware": tokens carry their support (live share, age); "traffic": tokens only. --router
 
 EPOCHS = 1000       # upper bound; early stopping on validation can stop earlier
 PATIENCE = 25       # stop after this many epochs without val improvement
 MIN_DELTA = 0.01    # vehicles/hour; smaller val improvements do not count
 LR = 1e-3           # learning rate
-Gamma_LR = 0.985    # LR = LR * Gamma_LR ** epochs. An epoch is now one pass over every district
+Gamma_LR = 0.985    # LR = LR * Gamma_LR ** epochs. An epoch is one pass over every district
 SEED = 0
 
 """
 Less hyper perameters probalby do not change
 """
 COMPILE = True  # one compiled graph per district size
-BATCH_SIZE = int(2 ** 10) # How to batch
+BATCH_SIZE = int(2 ** 8)  # origins per step; every district runs on the same origins
 PLOT_FIGURES = False  # False skips the 10 figures per district, good for debug
 TIME_FEATURES = ("tod_sin", "tod_cos", "dow_sin", "dow_cos")  # from features.npz time_features
 INPUT_CHANNELS = ("intensity", "occupancy", "intensity_mask", "intensity_age") + TIME_FEATURES  # last axis of X
 N_CHANNELS = len(INPUT_CHANNELS)
+FULL_CITY = 0  # district id used for the whole city as one graph
 
 MODEL_NAMES = {"district": "GTCNN + district attention",
                "shared": "GTCNN + neighbour attention",
@@ -61,15 +71,16 @@ def district_ids():
     return sorted(int(p.stem.rsplit("_", 1)[1]) for p in (DATA_DIR / "graph").glob("nodes_district_*.csv"))
 
 
-def load_district_graph(n_sensors: int, district: int) -> torch.Tensor:
-    """Spatial shift operator of the district route graph, normalised D^-1/2 A D^-1/2."""
+def load_graph(n_sensors: int, edge_file: str) -> torch.Tensor:
+    """Spatial shift operator of a route graph, normalised D^-1/2 A D^-1/2."""
     A = np.zeros((n_sensors, n_sensors), dtype=np.float32)
-    with open(DATA_DIR / "graph" / f"edges_district_{district:02d}.csv") as f:
+    with open(DATA_DIR / "graph" / edge_file) as f:
         for e in csv.DictReader(f):
             i, j = int(e["target_index"]), int(e["source_index"])
             A[i, j] = A[j, i] = 1.0
     d = A.sum(axis=1)
-    d_inv_sqrt = np.where(d > 0, d ** -0.5, 0.0).astype(np.float32)
+    d_inv_sqrt = np.where(d > 0, d, 1.0) ** -0.5 * (d > 0)
+    d_inv_sqrt = d_inv_sqrt.astype(np.float32)
     return torch.from_numpy(d_inv_sqrt[:, None] * A * d_inv_sqrt[None, :])
 
 
@@ -85,6 +96,20 @@ def neighbourhood(S: torch.Tensor, hops: int) -> torch.Tensor:
     N = S.shape[0]
     R = ((S > 0) | torch.eye(N, dtype=torch.bool, device=S.device)).float()
     return torch.linalg.matrix_power(R, hops) > 0
+
+
+def cross_district_prior(ids, device) -> torch.Tensor:
+    """[D, D] log(1 + total route-edge weight from district j into district i). Rows are receivers."""
+    pos = {d: i for i, d in enumerate(ids)}
+    w = np.zeros((len(ids), len(ids)), dtype=np.float32)
+    path = DATA_DIR / "graph" / "edges_cross_district.csv"
+    if len(ids) > 1 and path.exists():
+        with open(path) as f:
+            for e in csv.DictReader(f):
+                i, j = pos.get(int(e["target_district"])), pos.get(int(e["source_district"]))
+                if i is not None and j is not None:
+                    w[i, j] += float(e["weight"])
+    return torch.from_numpy(np.log1p(w)).to(device)
 
 
 @lru_cache(maxsize=1)
@@ -115,14 +140,18 @@ def shared_data():
 
 class District:
     """One district on the device: its graph and its [T, N] arrays. Windows are cut per batch,
-    so every district fits in memory at once and training can mix them."""
+    so every district fits in memory at once. District FULL_CITY is every sensor on the full graph."""
 
     def __init__(self, district: int, device):
         sh = shared_data()
         self.id = district
-        self.cols = load_sensors(district)
+        if district == FULL_CITY:
+            self.cols = np.arange(sh["intensity"].shape[1])
+            self.S = load_graph(len(self.cols), "edges_full.csv").to(device)  # indices are feature columns
+        else:
+            self.cols = load_sensors(district)
+            self.S = load_graph(len(self.cols), f"edges_district_{district:02d}.csv").to(device)  # [N, N]
         self.n = len(self.cols)
-        self.S = load_district_graph(self.n, district).to(device)  # [N, N]
         self.reach = neighbourhood(self.S, A_TAPS)  # [N, N]
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a[:, self.cols])).to(device)
         self.intensity, self.occupancy, self.observed = t(sh["intensity"]), t(sh["occupancy"]), t(sh["observed"])
@@ -130,6 +159,24 @@ class District:
         self.mean = torch.from_numpy(sh["mean"][self.cols]).to(device)
         self.std = torch.from_numpy(sh["std"][self.cols]).to(device)
         self.origins = {s: torch.from_numpy(o).to(device) for s, o in sh["origins"].items()}
+
+
+class City:
+    """Every district of a run (or the whole city as one district), plus the shared time features
+    and the cross-district edge prior."""
+
+    def __init__(self, device, partition="district"):
+        t0 = time.perf_counter()
+        ids = [FULL_CITY] if partition == "none" else district_ids()
+        self.districts = [District(d, device) for d in ids]
+        self.time = torch.from_numpy(shared_data()["time"]).to(device)
+        self.log_w = cross_district_prior(ids, device)
+        self.origins = self.districts[0].origins  # the same windows for every district
+        print(f"  loaded districts {ids} in {time.perf_counter() - t0:.1f}s")
+
+    @property
+    def n_sensors(self):
+        return sum(d.n for d in self.districts)
 
 
 @lru_cache(maxsize=1)
@@ -152,20 +199,20 @@ def gather(dist: District, time_feats: torch.Tensor, origins: torch.Tensor):
     return X, y, mask
 
 
-def load_all(device):
-    t0 = time.perf_counter()
-    districts = [District(d, device) for d in district_ids()]
-    time_feats = torch.from_numpy(shared_data()["time"]).to(device)
-    print(f"  loaded districts {[d.id for d in districts]} in {time.perf_counter() - t0:.1f}s")
-    return districts, time_feats
+def support(dist: District, origins: torch.Tensor) -> torch.Tensor:
+    """[B, 2]: share of the district's sensors with a real reading at the origin, and their mean age.
+    Taken from the mask and age, never from the filled values (those look like real traffic)."""
+    return torch.stack([dist.observed[origins].float().mean(1), dist.age[origins].mean(1)], dim=1)
 
 
-def save_checkpoint(model, path, trained_districts, best_epoch, seed):
+def save_checkpoint(model, path, trained_districts, best_epoch, seed, run):
     ckpt = dict(
-        format=3,  # 3: 8 input channels and output = latest reading + change
+        format=4,  # 4: district tokens and router
         state_dict={k: v.detach().cpu() for k, v in model.state_dict().items()},   # weights only, no graph buffers
         config=dict(WINDOW=WINDOW, HORIZONS=list(HORIZONS), C_TAPS=C_TAPS, A_TAPS=A_TAPS, N_FEAT=N_FEAT,
-                    HIDDEN=HIDDEN, attn=model.attn_kind, k=getattr(model.attn, "k", None)),
+                    HIDDEN=HIDDEN),
+        model=model.kwargs,  # what GTCNN(**model) needs
+        run=run,  # partition and exchange
         input_channels=list(INPUT_CHANNELS),   # last axis of X, in order
         trained_districts=list(trained_districts),
         best_epoch=best_epoch, seed=seed,
@@ -176,18 +223,18 @@ def save_checkpoint(model, path, trained_districts, best_epoch, seed):
 
 
 def load_trained(path, device="cpu"):
-    """Checkpoint -> model (eval mode), plus every district and the time features on `device`."""
+    """Checkpoint -> model (eval mode) and the City it was trained on, on `device`."""
     ckpt = torch.load(path, map_location="cpu", weights_only=True)     # plain tensors/dicts only: safe to load
-    assert ckpt.get("format") == 3, "checkpoint is from an older version of this file (other inputs/outputs)"
+    assert ckpt.get("format") == 4, "checkpoint is from an older version of this file (other inputs/outputs)"
     cfg = ckpt["config"]
     mine = dict(WINDOW=WINDOW, HORIZONS=list(HORIZONS), C_TAPS=C_TAPS, A_TAPS=A_TAPS, N_FEAT=N_FEAT, HIDDEN=HIDDEN)
     bad = {k: (cfg[k], mine[k]) for k in mine if cfg[k] != mine[k]}
     assert not bad, f"constants differ from the checkpoint (checkpoint, this file): {bad}"
     device = torch.device(device)
-    model = GTCNN(cfg["attn"]).to(device)
+    model = GTCNN(**ckpt["model"]).to(device)
     model.load_state_dict(ckpt["state_dict"])
-    districts, time_feats = load_all(device)
-    return model.eval(), districts, time_feats
+    city = City(device, ckpt["run"]["partition"])
+    return model.eval(), city
 
 
 # --------------------------------------------------------------- model
@@ -266,13 +313,61 @@ class StructuredGraphFilter(nn.Module):
         return chunked_linear(torch.cat(taps, dim=-1), W, self.bias)
 
 
-class GTCNN(nn.Module):
-    """Spatial attention, then a space-time filter layer, two hidden layers and one shared head
-    that predicts every horizon. Every node runs the exact same network with the same weights,
-    and the graph is an input, so one model serves every district."""
+class SupportRouter(nn.Module):
+    """Each district reads the K most useful tokens of the other districts
 
-    def __init__(self, attn: str = ATTN):
+    score  e(d<-d') = (Wq u_d) . (Wk [u_d' | s_d']) / sqrt(F)  (+ beta log w(d'->d))
+    keep the top K, softmax -> alpha, then scale by the gate g = sigmoid(wg . [s_d' | s_d] + bg)
+    context r_d = sum alpha * g * Wv u_d'
+
+    aware=False is the traffic-only router: no support in the keys and no gate."""
+
+    def __init__(self, f: int, k: int = K, aware: bool = True, gate: bool = True, prior: bool = False):
         super().__init__()
+        self.k, self.aware = k, aware
+        s = 2 if aware else 0
+        self.q = nn.Linear(f, f, bias=False)
+        self.key = nn.Linear(f + s, f, bias=False)
+        self.v = nn.Linear(f, f, bias=False)
+        self.gate = nn.Linear(2 * s, 1) if aware and gate else None
+        self.beta = nn.Parameter(torch.zeros(())) if prior else None
+        self.last = None  # (picked districts [B, D, K], weights [B, D, K]) of the last call, for analysis
+
+    def forward(self, u, s, log_w):  # u [B, D, F] tokens, s [B, D, 2] support, log_w [D, D]
+        B, D, f = u.shape
+        if self.k == 0 or D == 1:
+            return torch.zeros_like(u)
+        keys = self.key(torch.cat([u, s], -1) if self.aware else u)
+        e = self.q(u) @ keys.transpose(1, 2) / f ** 0.5  # [B, D receivers, D sources]
+        if self.beta is not None:
+            e = e + self.beta * log_w
+        e = e.masked_fill(torch.eye(D, dtype=torch.bool, device=u.device), float("-inf"))  # never itself
+        top, idx = e.topk(min(self.k, D - 1), dim=-1)  # [B, D, K]
+        alpha = top.softmax(-1)
+        if self.gate is not None:
+            # pair[b, i, j] = [support of source j | support of receiver i]
+            pair = torch.cat([s[:, None].expand(B, D, D, 2), s[:, :, None].expand(B, D, D, 2)], -1)
+            alpha = alpha * torch.sigmoid(self.gate(pair)).squeeze(-1).gather(2, idx)
+        vals = self.v(u)[torch.arange(B, device=u.device)[:, None, None], idx]  # [B, D, K, F]
+        self.last = (idx.detach(), alpha.detach())
+        return (alpha[..., None] * vals).sum(2)  # [B, D, F]
+
+    def scalars_received(self, n_districts: int) -> int:
+        """Numbers each district receives per origin: K tokens, plus their support if aware."""
+        if self.k == 0 or n_districts == 1:
+            return 0
+        return min(self.k, n_districts - 1) * (self.q.in_features + (2 if self.aware else 0))
+
+
+class GTCNN(nn.Module):
+    """Local encoder (spatial attention, a space-time filter layer, hidden layers) on one district,
+    a router that brings in other districts' tokens, and one shared head that predicts every horizon.
+    Every node runs the exact same network with the same weights, and the graph is an input,
+    so one model serves every district."""
+
+    def __init__(self, attn: str = ATTN, k: int = K, router: str = ROUTER, gate: bool = True, prior: bool = False):
+        super().__init__()
+        self.kwargs = dict(attn=attn, k=k, router=router, gate=gate, prior=prior)
         self.attn_kind = attn
         self.attn = {"district": lambda: DistrictGATAttention(N_CHANNELS),
                      "shared": lambda: SharedGATAttention(N_CHANNELS),
@@ -281,10 +376,12 @@ class GTCNN(nn.Module):
         self.fc = nn.Linear(WINDOW * N_FEAT, HIDDEN)  # <-- extra hidden layer
         self.fc2 = nn.Linear(HIDDEN, HIDDEN)  # <-- extra hidden layer
         self.fc3 = nn.Linear(HIDDEN, HIDDEN)  # <-- extra hidden layer
-        self.head = nn.Linear(HIDDEN, len(HORIZONS))  # the same head at every node, one output per horizon
+        self.router = SupportRouter(HIDDEN, k, aware=router == "aware", gate=gate, prior=prior)
+        self.head = nn.Linear(2 * HIDDEN, len(HORIZONS))  # own state | context from other districts
 
-    def forward(self, x: torch.Tensor, S: torch.Tensor, reach: torch.Tensor) -> torch.Tensor:  # x: [B, WINDOW, N, C]
-        last = x[:, -1, :, :1]  # [B, N, 1] latest intensity, before attention changes x
+    def encode(self, x: torch.Tensor, S: torch.Tensor, reach: torch.Tensor):  # x: [B, WINDOW, N, C]
+        """Node states h [B, N, HIDDEN] and the latest intensity [B, N, 1]."""
+        last = x[:, -1, :, :1]  # latest intensity, before attention changes x
         if self.attn is not None:
             x = self.attn(x, reach)  # [B, T, N, C]
         z = torch.relu(self.filter1(x, S))  # [B, T, N, F]
@@ -292,7 +389,14 @@ class GTCNN(nn.Module):
         z = torch.relu(self.fc(z))  # <-- hidden layer + activation
         z = torch.relu(self.fc2(z))
         z = torch.relu(self.fc3(z))
-        return last + self.head(z)  # [B, N, H] latest reading + predicted change per horizon
+        return z, last
+
+    def decode(self, h, last, r=None):  # r [B, HIDDEN] context for this district, None = no exchange
+        r = torch.zeros_like(h) if r is None else r[:, None, :].expand_as(h)
+        return last + self.head(torch.cat([h, r], -1))  # [B, N, H] latest reading + change per horizon
+
+    def forward(self, x, S, reach):  # one district on its own, no exchange
+        return self.decode(*self.encode(x, S, reach))
 
 
 def masked_mae(pred, y, mask):
@@ -307,43 +411,130 @@ def chunked_linear(x, W, bias, chunks=512):  # x [..., K], W [F_out, K]
     return out.reshape(*x.shape[:-1], -1) + bias
 
 
-# --------------------------------------------------------------- train
+# --------------------------------------------------------------- city forward pass
 
-def train_epoch(model, districts, time_feats, optimizer, gen):
-    """One pass over every training window of every district, batches of all districts shuffled
-    together so no district is forgotten. Loss: masked MAE on standardised intensity, all horizons."""
-    model.train()
-    batches = []
-    for di, d in enumerate(districts):
-        o = d.origins["train"]
-        o = o[torch.randperm(len(o), generator=gen).to(o.device)]
-        batches += [(di, o[b:b + BATCH_SIZE]) for b in range(0, len(o), BATCH_SIZE)]
-    total = torch.zeros((), device=time_feats.device)
-    for i in torch.randperm(len(batches), generator=gen).tolist():
-        di, ob = batches[i]
-        d = districts[di]
-        X, y, mask = gather(d, time_feats, ob)
-        loss = masked_mae(model(X, d.S, d.reach), y, mask)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total += loss.detach()
-    return (total / len(batches)).item()  # one sync per epoch
+def talks(model, city) -> bool:
+    return model.router.k > 0 and len(city.districts) > 1
 
 
 @torch.no_grad()
-def predict(model, d: District, time_feats, split):
-    """Predictions, targets (both vehicles/hour) and genuine-target mask: [n_windows, N, H]."""
-    model.eval()
-    o = d.origins[split]
-    preds, ys, masks = [], [], []
+def tokens(model, city, origins, encode):
+    """Pass 1: every district's token u [B, D, F] and support s [B, D, 2] at these origins."""
+    u = torch.stack([encode(gather(d, city.time, origins)[0], d.S, d.reach)[0].mean(1) for d in city.districts], 1)
+    s = torch.stack([support(d, origins) for d in city.districts], 1)
+    return u, s
+
+
+def city_outputs(model, city, origins, encode, exchange="detached"):
+    """Yields (pred, y, mask) for every district at these origins, standardised, one district at a time.
+
+    detached: pass 1 makes every token without gradients, pass 2 runs each district with its own token
+    live and the other districts' tokens fixed. Memory stays at the size of one district, and because
+    the weights are shared every weight is still trained. full: one pass, gradients everywhere."""
+    ds = city.districts
+    if not talks(model, city):
+        for d in ds:
+            X, y, mask = gather(d, city.time, origins)
+            h, last = encode(X, d.S, d.reach)
+            yield model.decode(h, last), y, mask
+        return
+
+    if exchange == "full" and torch.is_grad_enabled():
+        outs = []
+        for d in ds:
+            X, y, mask = gather(d, city.time, origins)
+            outs.append((*encode(X, d.S, d.reach), y, mask))
+        u = torch.stack([h.mean(1) for h, _, _, _ in outs], 1)
+        s = torch.stack([support(d, origins) for d in ds], 1)
+        r = model.router(u, s, city.log_w)
+        for di, (h, last, y, mask) in enumerate(outs):
+            yield model.decode(h, last, r[:, di]), y, mask
+        return
+
+    u, s = tokens(model, city, origins, encode)
+    training = torch.is_grad_enabled()
+    if not training:  # evaluation: the tokens are exact, so one router call serves every district
+        r = model.router(u, s, city.log_w)
+    for di, d in enumerate(ds):
+        X, y, mask = gather(d, city.time, origins)
+        h, last = encode(X, d.S, d.reach)
+        if training:
+            u_d = u.clone()
+            u_d[:, di] = h.mean(1)  # own token with gradients, the others fixed
+            r_d = model.router(u_d, s, city.log_w)[:, di]
+        else:
+            r_d = r[:, di]
+        yield model.decode(h, last, r_d), y, mask
+
+
+# --------------------------------------------------------------- train
+
+def train_epoch(model, city, optimizer, gen, encode, exchange="detached"):
+    """One pass over every training window. A step covers every district at the same origins.
+    Loss: masked MAE on standardised intensity, all horizons, pooled over every sensor."""
+    model.train()
+    o = city.origins["train"]
+    o = o[torch.randperm(len(o), generator=gen).to(o.device)]
+    _, ahead = window_offsets(o.device)
+    total = torch.zeros((), device=o.device)
+    n_steps = 0
     for b in range(0, len(o), BATCH_SIZE):
-        X, y, mask = gather(d, time_feats, o[b:b + BATCH_SIZE])
-        preds.append(model(X, d.S, d.reach))
-        ys.append(y)
-        masks.append(mask)
+        ob = o[b:b + BATCH_SIZE]
+        n_targets = sum(d.observed[ob[:, None] + ahead].sum() for d in city.districts).clamp(min=1)
+        optimizer.zero_grad()
+        if exchange == "full":
+            loss = sum(((p - y).abs() * m).sum() for p, y, m in city_outputs(model, city, ob, encode, "full"))
+            loss = loss / n_targets
+            loss.backward()
+            total += loss.detach()
+        else:
+            for p, y, m in city_outputs(model, city, ob, encode):
+                loss = ((p - y).abs() * m).sum() / n_targets
+                loss.backward()  # gradients add up over the districts, memory is freed per district
+                total += loss.detach()
+        optimizer.step()
+        n_steps += 1
+    return (total / n_steps).item()  # one sync per epoch
+
+
+@torch.no_grad()
+def score(model, city, split, encode=None):
+    """Pooled over every district: per horizon MAE and RMSE in vehicles/hour, plus per-district MAE."""
+    model.eval()
+    encode = encode or model.encode
+    D, H = len(city.districts), len(HORIZONS)
+    abs_sum = torch.zeros(D, H, device=city.time.device, dtype=torch.float64)
+    sq_sum, count = abs_sum.clone(), abs_sum.clone()
+    o = city.origins[split]
+    for b in range(0, len(o), BATCH_SIZE):
+        for di, (pred, y, mask) in enumerate(city_outputs(model, city, o[b:b + BATCH_SIZE], encode)):
+            m = mask.double()
+            err = ((pred - y) * city.districts[di].std[None, :, None]).double() * m  # veh/h, the mean cancels
+            abs_sum[di] += err.abs().sum((0, 1))
+            sq_sum[di] += err.square().sum((0, 1))
+            count[di] += m.sum((0, 1))
+    per_district = {d.id: (abs_sum[i] / count[i].clamp(min=1)).tolist() for i, d in enumerate(city.districts)}
+    abs_sum, sq_sum, count = abs_sum.sum(0), sq_sum.sum(0), count.sum(0)
+    count_l = count.long().tolist()
+    if DISTRICTS is None:  # all districts together are exactly the sensors the baselines score
+        assert count_l == expected_targets(split), \
+            f"{split}: scored {count_l} targets, baselines score {expected_targets(split)}"
+    mae = (abs_sum / count.clamp(min=1)).tolist()
+    rmse = (sq_sum / count.clamp(min=1)).sqrt().tolist()
+    return mae, rmse, count_l, per_district
+
+
+@torch.no_grad()
+def predict(model, city, di, split, encode=None):
+    """One district's predictions, targets (both vehicles/hour) and genuine-target mask: [n_windows, N, H]."""
+    model.eval()
+    encode = encode or model.encode
+    d = city.districts[di]
+    o = city.origins[split]
+    parts = [list(city_outputs(model, city, o[b:b + BATCH_SIZE], encode))[di] for b in range(0, len(o), BATCH_SIZE)]
+    pred, y, mask = (torch.cat(t) for t in zip(*parts))
     scale = lambda t: t * d.std[None, :, None] + d.mean[None, :, None]
-    return scale(torch.cat(preds)), scale(torch.cat(ys)), torch.cat(masks)
+    return scale(pred), scale(y), mask
 
 
 def expected_targets(split):
@@ -353,25 +544,23 @@ def expected_targets(split):
     return [int(sh["observed"][o + h].sum()) for h in HORIZONS]
 
 
-def score(model, districts, time_feats, split):
-    """Pooled over every district: per horizon MAE and RMSE in vehicles/hour, plus per-district MAE."""
-    abs_sum = torch.zeros(len(HORIZONS), device=time_feats.device, dtype=torch.float64)
-    sq_sum, count = abs_sum.clone(), abs_sum.clone()
-    per_district = {}
-    for d in districts:
-        pred, y, mask = predict(model, d, time_feats, split)
-        m = mask.double()
-        err = (pred - y).double() * m
-        a, s, c = err.abs().sum((0, 1)), err.square().sum((0, 1)), m.sum((0, 1))
-        abs_sum, sq_sum, count = abs_sum + a, sq_sum + s, count + c
-        per_district[d.id] = (a / c.clamp(min=1)).tolist()
-    count_l = count.long().tolist()
-    if DISTRICTS is None:  # all districts together are exactly the sensors the baselines score
-        assert count_l == expected_targets(split), \
-            f"{split}: scored {count_l} targets, baselines score {expected_targets(split)}"
-    mae = (abs_sum / count.clamp(min=1)).tolist()
-    rmse = (sq_sum / count.clamp(min=1)).sqrt().tolist()
-    return mae, rmse, count_l, per_district
+@torch.no_grad()
+def router_stats(model, city, split, path):
+    """Save which districts every district picked, their weights and every token's support (for the figures)."""
+    if not talks(model, city):
+        return
+    model.eval()
+    o = city.origins[split]
+    picks, weights, sup = [], [], []
+    for b in range(0, len(o), BATCH_SIZE):
+        u, s = tokens(model, city, o[b:b + BATCH_SIZE], model.encode)
+        model.router(u, s, city.log_w)
+        idx, alpha = model.router.last
+        picks.append(idx.cpu()), weights.append(alpha.cpu()), sup.append(s.cpu())
+    ids = np.array([d.id for d in city.districts])
+    np.savez(path, district_ids=ids, origins=o.cpu().numpy(), picks=ids[torch.cat(picks).numpy()],
+             weights=torch.cat(weights).numpy(), support=torch.cat(sup).numpy())
+    print(f"  router picks: {path}")
 
 
 def save_result(model_name: str, seed: int, results: dict):
@@ -395,10 +584,11 @@ def save_result(model_name: str, seed: int, results: dict):
     print(f"  saved to {path}")
 
 
-def plot_sensors(model, d: District, time_feats, h_index=1):
-    """Last week of test at 10 sensors of the district, `h_index` = 1 is 30 min ahead."""
+def plot_sensors(model, city, di, h_index=1):
+    """Last week of test at 10 sensors of one district, `h_index` = 1 is 30 min ahead."""
     sh = shared_data()
-    pred, y, mask = predict(model, d, time_feats, "test")
+    d = city.districts[di]
+    pred, y, mask = predict(model, city, di, "test")
     t_test = sh["timestamps"][d.origins["test"].cpu().numpy() + HORIZONS[h_index]]
     pred_np, y_np = pred[..., h_index].cpu().numpy(), y[..., h_index].cpu().numpy()
     y_np[~mask[..., h_index].cpu().numpy()] = np.nan
@@ -445,6 +635,32 @@ def district_check(d: District, time_feats, tol=1e-4):
     assert err < tol
 
 
+def router_check(router: SupportRouter, u, s, log_w, tol=1e-5):
+    """Check the router against a plain loop over every receiver, batch element and pick."""
+    with torch.no_grad():
+        got = router(u, s, log_w)
+        B, D, f = u.shape
+        want = torch.zeros_like(u)
+        for b in range(B):  # plain loops: obviously correct
+            for i in range(D):
+                q = router.q(u[b, i])
+                e = []
+                for j in range(D):
+                    key_in = torch.cat([u[b, j], s[b, j]]) if router.aware else u[b, j]
+                    e.append(-float("inf") if j == i else
+                             float(q @ router.key(key_in) / f ** 0.5
+                                   + (router.beta * log_w[i, j] if router.beta is not None else 0)))
+                e = torch.tensor(e)
+                top, idx = e.topk(min(router.k, D - 1))
+                alpha = top.softmax(0)
+                for a, j in zip(alpha, idx.tolist()):
+                    g = torch.sigmoid(router.gate(torch.cat([s[b, j], s[b, i]]))).item() if router.gate is not None else 1.0
+                    want[b, i] += a * g * router.v(u[b, j])
+        err = (got - want).abs().max().item()
+    print(f"router vs plain loop: max |diff| {err:.2e}")
+    assert err < tol
+
+
 def district_bench(d: District, time_feats, reps=10):
     device = d.S.device
     xb, _, _ = gather(d, time_feats, d.origins["train"][:BATCH_SIZE])
@@ -475,15 +691,43 @@ def district_bench(d: District, time_feats, reps=10):
 
 # --------------------------------------------------------------- main
 
+def run_name(args) -> str:
+    """Model name in graph_results.csv, built from the flags."""
+    name = MODEL_NAMES[args.attn]
+    if args.partition == "none":
+        return f"Full-city {name}"
+    if args.k == 0:
+        return f"{name} (no exchange)"
+    name += f", {args.router} router K={args.k}"
+    if args.router == "aware" and args.gate == "off":
+        name += ", no gate"
+    if args.prior:
+        name += ", edge prior"
+    if args.exchange == "full":
+        name += ", full exchange"
+    return name
+
+
 def main():
-    global EPOCHS
+    global EPOCHS, DATA_DIR
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attn", choices=list(MODEL_NAMES), default=ATTN)
+    parser.add_argument("--attn", choices=list(MODEL_NAMES), default=ATTN, help="local attention inside a district")
+    parser.add_argument("--k", type=int, default=K, help="other-district tokens each district reads, 0 = none")
+    parser.add_argument("--router", choices=("aware", "traffic"), default=ROUTER)
+    parser.add_argument("--gate", choices=("on", "off"), default="on", help="support gate (aware router only)")
+    parser.add_argument("--prior", action="store_true", help="add beta * log(cross-district edge weight)")
+    parser.add_argument("--exchange", choices=("detached", "full"), default="detached",
+                        help="detached: other districts' tokens carry no gradient (memory of one district)")
+    parser.add_argument("--partition", choices=("district", "none"), default="district",
+                        help="none = the whole city as one graph, no exchange")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
-    EPOCHS = args.epochs
+    EPOCHS, DATA_DIR = args.epochs, args.data_dir
+    if args.partition == "none":
+        args.k = 0  # one graph, nobody to exchange with
 
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(args.seed)
@@ -493,16 +737,19 @@ def main():
         else "cpu"
     )
 
-    districts, time_feats = load_all(device)
-    model = GTCNN(args.attn).to(device)  # one model for every district
-    model_name = MODEL_NAMES[args.attn]
-    print(f"device={device} model='{model_name}' seed={args.seed} districts={[d.id for d in districts]} "
-          f"sensors={sum(d.n for d in districts)} parameters={sum(p.numel() for p in model.parameters()):,}")
+    city = City(device, args.partition)
+    model = GTCNN(args.attn, args.k, args.router, args.gate == "on", args.prior).to(device)  # one model for every district
+    model_name = run_name(args)
+    print(f"device={device} data={DATA_DIR} model='{model_name}' seed={args.seed} "
+          f"districts={[d.id for d in city.districts]} sensors={city.n_sensors} "
+          f"largest district={max(d.n for d in city.districts)} "
+          f"parameters={sum(p.numel() for p in model.parameters()):,} "
+          f"scalars received per district per origin={model.router.scalars_received(len(city.districts))}")
     for s in ("train", "val", "test"):
-        print(f"  {s}: {len(districts[0].origins[s]):,} windows")
+        print(f"  {s}: {len(city.origins[s]):,} windows")
 
     torch._dynamo.config.cache_size_limit = 64  # a few graphs per district size
-    run_model = torch.compile(model) if COMPILE and not args.no_compile else model
+    encode = torch.compile(model.encode) if COMPILE and not args.no_compile else model.encode
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=Gamma_LR)
@@ -512,8 +759,8 @@ def main():
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
-        tr = train_epoch(run_model, districts, time_feats, optimizer, gen)
-        va_mae, _, _, _ = score(run_model, districts, time_feats, "val")
+        tr = train_epoch(model, city, optimizer, gen, encode, args.exchange)
+        va_mae, _, _, _ = score(model, city, "val", encode)
         va = float(np.mean(va_mae))  # model selection: val MAE in vehicles/hour, mean over horizons
         scheduler.step()
         if va < best_val - MIN_DELTA:
@@ -537,22 +784,25 @@ def main():
     #Saving the model!
     tag = time.strftime("%Y%m%d_%H%M")
     Path("checkpoints").mkdir(exist_ok=True)
-    ckpt_path = f"checkpoints/gtcnn_{args.attn}_seed{args.seed}_{tag}.pt"
-    save_checkpoint(model, ckpt_path, [d.id for d in districts], best_epoch, args.seed)
-    reloaded = GTCNN(args.attn).to(device)
+    slug = f"{args.partition}_{args.attn}_k{args.k}_{args.router}" + ("_nogate" if args.gate == "off" else "") \
+           + ("_prior" if args.prior else "") + ("_full" if args.exchange == "full" else "")
+    ckpt_path = f"checkpoints/gtcnn_{slug}_seed{args.seed}_{tag}.pt"
+    save_checkpoint(model, ckpt_path, [d.id for d in city.districts], best_epoch, args.seed,
+                    dict(partition=args.partition, exchange=args.exchange, data_dir=str(DATA_DIR)))
+    reloaded = GTCNN(**model.kwargs).to(device)
     reloaded.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True)["state_dict"])
     model.eval(), reloaded.eval()
     with torch.no_grad():
-        d = districts[0]
-        X, _, _ = gather(d, time_feats, d.origins["train"][:8])
-        assert torch.allclose(model(X, d.S, d.reach), reloaded(X, d.S, d.reach), atol=1e-6), \
-            "checkpoint round-trip mismatch"
+        o = city.origins["train"][:8]
+        for (a, _, _), (b, _, _) in zip(city_outputs(model, city, o, model.encode),
+                                        city_outputs(reloaded, city, o, reloaded.encode)):
+            assert torch.allclose(a, b, atol=1e-6), "checkpoint round-trip mismatch"
     print(f"saved {ckpt_path}")
 
     # final scores with the best weights, eager (no compile)
     results = {}
     for split in ("val", "test"):
-        mae, rmse, count, per_district = score(model, districts, time_feats, split)
+        mae, rmse, count, per_district = score(model, city, split)
         results[split] = (mae, rmse)
     print(f"\n{model_name}, test, every window and sensor, genuine targets (vehicles/hour):")
     print(f"  {'horizon':>8} {'MAE':>8} {'RMSE':>8} {'targets':>10}")
@@ -561,10 +811,11 @@ def main():
     print(f"\n  test MAE per district: " + ", ".join(f"{k}: {v[0]:.1f}/{v[-1]:.1f}" for k, v in per_district.items())
           + f"  ({HORIZONS[0] * 15}/{HORIZONS[-1] * 15} min)")
     save_result(model_name, args.seed, results)
+    router_stats(model, city, "test", DATA_DIR / "reports" / f"router_{slug}_seed{args.seed}.npz")
 
     if PLOT_FIGURES:
-        for d in districts:
-            plot_sensors(model, d, time_feats)
+        for di in range(len(city.districts)):
+            plot_sensors(model, city, di)
 
 
 if __name__ == "__main__":

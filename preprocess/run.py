@@ -5,21 +5,24 @@
 # python -m preprocess.run --from observed # resume from a stage onwards
 # python -m preprocess.run --selection districts --n-districts 6 --min-coverage 0.9
 # python -m preprocess.run --from windows --history-length 8
+# python -m preprocess.run --stages fill_eval # score the input fill on hidden validation cells
 
 # Stages run in dependency order:
 
 # convert->audit->select->graphs->observed->params->windows->features->checks->report
+# Optional stages (fill_eval) only run when named with --stages.
 
 import argparse
 import sys
 import time
 import numpy as np
 from . import config as C
-from . import audit, sensor_selection, graphs, observed, params, windows, features, raw, checks, report
+from . import audit, sensor_selection, graphs, observed, params, windows, features, fill, raw, checks, report
 
 
 STAGES = ("convert", "audit", "select", "graphs", "observed", "params"
           , "windows", "features", "checks", "report")
+OPTIONAL_STAGES = ("fill_eval",)
 
 
 def _stage_convert(args):
@@ -73,10 +76,6 @@ def _stage_params(args):
                  out_dir=args.out_dir)
 
 
-# def _stage_fill(args):
-#     fill.build(out_dir=args.out_dir)
-
-
 def _stage_windows(args):
     """
     Run the windows stage to generate the training and test windows for each sensor.
@@ -98,6 +97,13 @@ def _stage_checks(args):
     checks.run(out_dir=args.out_dir, strict=not args.no_strict)
 
 
+def _stage_fill_eval(args):
+    """
+    Score the input fill against genuine validation cells hidden as missing.
+    """
+    fill.evaluate(out_dir=args.out_dir)
+
+
 def _stage_report(args):
     """
     Run the report stage to generate a summary report of the pipeline run.
@@ -116,6 +122,7 @@ RUNNERS = {
     "features": _stage_features,
     "checks": _stage_checks,
     "report": _stage_report,
+    "fill_eval": _stage_fill_eval,
 }
 
 
@@ -125,7 +132,7 @@ def parse_args(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--stages", nargs="+", choices=STAGES,
+    p.add_argument("--stages", nargs="+", choices=STAGES + OPTIONAL_STAGES,
                    help="run only these stages (default: all)")
     p.add_argument("--from", dest="from_stage", choices=STAGES,
                    help="run from this stage to the end")
@@ -154,7 +161,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     if args.stages:
-        stages = [s for s in STAGES if s in set(args.stages)]
+        stages = [s for s in STAGES + OPTIONAL_STAGES if s in set(args.stages)]
     elif args.from_stage:
         stages = list(STAGES[STAGES.index(args.from_stage):])
     else:

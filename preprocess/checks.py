@@ -3,7 +3,8 @@
 import numpy as np
 import pandas as pd
 from . import config as C
-from . import features, graphs, observed, params, sensor_selection, splits, timeline, windows
+from . import features, fill, graphs, observed, params, sensor_selection, splits, timeline, windows
+from .config import FillSource
 
 def _result(name: str, problems: list, **extra) -> dict:
     return {"name": name, "passed": not problems, "problems": problems, **extra}
@@ -168,10 +169,21 @@ def check_no_leakage(out_dir=C.OUT_DIR) -> dict:
         ("profile", params.fit_profile, "observed_intensity", "mask", 1e5,
          {"profile": "profile"}),
     )
+    edges = graphs.load_full_edges(out_dir)
+    fill_keys = ("profile", "resid_std", "phi", "spatial_var",
+                 "edge_target", "edge_source", "edge_beta", "edge_weight")
+    for ch, (vk, mk, log, top, min_std) in fill.CHANNELS.items():
+        fits += ((f"{ch} fill",
+                  lambda o, m, i, log=log, min_std=min_std:
+                      fill.fit_fill_params(o, m, i, edges, log=log, min_std=min_std),
+                  vk, mk, top, {k: f"fill_{ch}_{k}" for k in fill_keys}),)
     for label, fit, vk, mk, top, keys in fits:
         ref = fit(obs[vk], obs[mk], index)
         alt = fit(corrupt(obs[vk], top), obs[mk], index)
         for k, sk in keys.items():
+            if np.shape(ref[k]) != np.shape(alt[k]) or np.shape(ref[k]) != np.shape(saved[sk]):
+                problems.append(f"{label} {k} changed shape between refits")
+                continue
             if not np.allclose(ref[k], alt[k], equal_nan=True):
                 problems.append(f"{label} {k} changed when non-training values "
                                 "were corrupted")
@@ -186,9 +198,11 @@ def check_feature_definitions(out_dir=C.OUT_DIR) -> dict:
     """features.npz is exactly the documented function of the observed layer.
 
     Rebuilds every feature array from ``observed.npz`` and the saved training
-    scalers and requires a bit-identical match; checks that masked-out cells
-    hold the missing value and nothing else, and that the history length
-    agrees with the window index.
+    parameters and requires a bit-identical match; checks that masked-out
+    cells hold the missing value (``FILL_METHOD == "none"``) or a fill rather
+    than an observation (``"graph_ar"``), that the age channels are the steps
+    since the last genuine observation, and that the history length agrees
+    with the window index.
     """
     obs = observed.load(out_dir)
     p = params.load(out_dir)
@@ -202,9 +216,19 @@ def check_feature_definitions(out_dir=C.OUT_DIR) -> dict:
         v, m = f[ch], f[f"{ch}_mask"]
         if not np.isfinite(v).all():
             problems.append(f"{ch} contains non-finite values")
-        if (v[~m] != np.float32(C.FEATURE_MISSING_VALUE)).any():
-            problems.append(f"{ch} holds something other than the missing "
-                            "value where its mask is False")
+        if C.FILL_METHOD == "none":
+            if (v[~m] != np.float32(C.FEATURE_MISSING_VALUE)).any():
+                problems.append(f"{ch} holds something other than the missing "
+                                "value where its mask is False")
+        else:
+            src = f[f"{ch}_fill_source"]
+            if not np.array_equal(src == FillSource.OBSERVED, m):
+                problems.append(f"{ch} fill source is not 'observed' exactly "
+                                "where the mask is True")
+        age, _ = fill.elapsed_steps(m)
+        if not np.array_equal(f[f"{ch}_age"],
+                              (age / np.float32(C.AGE_CLIP_STEPS)).astype(np.float32)):
+            problems.append(f"{ch}_age is not the steps since the last genuine observation")
     if f["time_feature_names"] != list(features.TIME_FEATURES):
         problems.append(f"time features are {f['time_feature_names']}, "
                         f"expected {list(features.TIME_FEATURES)}")
@@ -224,7 +248,10 @@ def check_feature_causality(out_dir=C.OUT_DIR, n_probe=24, seed=C.RANDOM_SEED,
     For each probe origin ``t``, builds the features once on data truncated at
     ``t`` and once on data whose next ``future_steps`` are garbage with both
     masks flipped, and requires the gathered ``L``-step history to be
-    bit-identical.  Also asserts the gathered rows end exactly at ``t``.
+    bit-identical.  Both builds start ``fill.context_steps()`` before the
+    history, the furthest back the fill and age features read, so the
+    truncated build also matches the stored features.  Also asserts the
+    gathered rows end exactly at ``t``.
     """
     obs = observed.load(out_dir)
     p = params.load(out_dir)
@@ -239,16 +266,18 @@ def check_feature_causality(out_dir=C.OUT_DIR, n_probe=24, seed=C.RANDOM_SEED,
     problems = []
 
     for t in origins:
-        lo, hi = t - L + 1, min(T, t + 1 + future_steps)
+        lo, hi = max(0, t - L + 1 - fill.context_steps()), min(T, t + 1 + future_steps)
+        n = t + 1 - lo  # rows up to and including the origin
         cut = {k: obs[k][lo: t + 1] for k in keys}
         bad = {k: obs[k][lo: hi].copy() for k in keys}
         for k, mk, top in (("observed_intensity", "mask", 9000.0),
                            ("observed_occupancy", "occupancy_mask", 100.0)):
-            bad[k][L:] = rng.uniform(0, top, size=bad[k][L:].shape)
-            bad[mk][L:] = ~bad[mk][L:]
-        ref = features.build_arrays(cut, p, index[lo: t + 1])
+            bad[k][n:] = rng.uniform(0, top, size=bad[k][n:].shape)
+            bad[mk][n:] = ~bad[mk][n:]
+        ref = {k: v[n - L:n] for k, v in
+               features.build_arrays(cut, p, index[lo: t + 1]).items()}
         alt = features.build_arrays(bad, p, index[lo: hi])
-        changed = [k for k in ref if not np.array_equal(ref[k], alt[k][:L])]
+        changed = [k for k in ref if not np.array_equal(ref[k], alt[k][n - L:n])]
         if changed:
             problems.append(f"origin {t} ({index[t]}): {changed[0]} changed "
                             "when the future was perturbed")
@@ -256,8 +285,8 @@ def check_feature_causality(out_dir=C.OUT_DIR, n_probe=24, seed=C.RANDOM_SEED,
         w = features.window_features(f, np.array([t]))
         if w["history_index"].shape[1] != L or w["history_index"][0, -1] != t:
             problems.append(f"origin {t}: gathered history does not end at the origin")
-        stale = [k for k in ("intensity", "intensity_mask", "occupancy", "occupancy_mask")
-                 if not np.array_equal(w[k][0], ref[k])]
+        stale = [k for k in features.PER_SENSOR_KEYS
+                 if k in w and not np.array_equal(w[k][0], ref[k])]
         if stale:
             problems.append(f"origin {t}: stored {stale[0]} history differs "
                             "from the truncated rebuild")

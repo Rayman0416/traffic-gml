@@ -1,10 +1,12 @@
 # Copy of the Lab 2.3 GTCNN (graph-time CNN) applied to GO-MO Madrid traffic.
 # Takes intensity (one DISTRICT, or all of them) + occupancy + time-of-day (tod_sin, tod_cos)
-# over the last WINDOW steps and predicts the intensity HORIZON steps ahead. The network
+# + time since the last real reading over the last WINDOW steps and predicts the intensity
+# HORIZON steps ahead. The network
 # runs a K-tap graph filter on a Cartesian product graph over space x time, as in Lab 2.3.
 #
 # Only reads data/forecast_dataset (built by `python -m preprocess.run`).
 
+import argparse
 import csv
 import time
 from pathlib import Path
@@ -25,11 +27,13 @@ N_TAPS = 3                # graph filter order
 N_FEAT = 32               # hidden features per layer
 BATCH_SIZE = 256          # full graph (1054 sensors), WINDOW = 6: lower it if the GPU runs out of memory
 EPOCHS = 100
-LR = 5e-3
-LR_DECAY = 0.995          # per-epoch lr factor: 0.995^300 = 0.22, so the last epochs still learn
+LR = 1e-3
+LR_FACTOR = 0.5           # ReduceLROnPlateau: multiply lr by this when val stops improving
+LR_PATIENCE = 5           # ReduceLROnPlateau: epochs without a val improvement before lowering lr
 PATIENCE = 10             # early stopping: stop after this many epochs without a val improvement
 MIN_DELTA = 1e-4          # smallest val loss drop that counts as an improvement
 LOSS = "mae"             # training loss: "rmse" or "mae" (both are reported on test)
+N_CHANNELS = 8            # intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos, age
 
 
 # ---------------------------------------------------------------- data
@@ -63,17 +67,19 @@ def load_sensors() -> np.ndarray:
     node_file, _, key = graph_files()
     nodes = sorted(csv.DictReader(open(DATA_DIR / "graph" / node_file)), key=lambda r: int(r[key]))
     # nodes.csv indexes by array_index (= feature column), district files by global_index
-    return np.array([int(r.get("global_index", r["array_index"])) for r in nodes], dtype=np.int64)
+    col = "global_index" if DISTRICT is not None else "array_index"
+    return np.array([int(r[col]) for r in nodes], dtype=np.int64)
 
 
-def load_split_tensors(cols: np.ndarray, split: str):
-    """X [n, WINDOW, N, 7] input windows (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos),
+def load_split_tensors(cols: np.ndarray, split: str, routine_only: bool = True):
+    """X [n, WINDOW, N, 8] input windows (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos, age),
     y [n, N] intensity at HORIZON steps ahead, the genuine-target mask, and the target row indices
     (for plotting against the clock)."""
     z = np.load(DATA_DIR / "features.npz")
-    intensity = z["intensity"][:, cols]        # [T, N] scaled intensity
+    intensity = z["intensity"][:, cols]        # [T, N] scaled intensity (gaps hold the causal fill)
     observed = z["intensity_mask"][:, cols]    # [T, N] genuine observations
-    occupancy = z["occupancy"][:, cols]        # [T, N] scaled occupancy (missing = 0)
+    occupancy = z["occupancy"][:, cols]        # [T, N] scaled occupancy (gaps hold the causal fill)
+    age = z["intensity_age"][:, cols]          # [T, N] steps since the last real reading / 96, 0 = real now
 
     # time features: tod_sin, tod_cos, dow_sin, dow_cos
     names = list(z["time_feature_names"])
@@ -87,22 +93,23 @@ def load_split_tensors(cols: np.ndarray, split: str):
 
     origins = np.array([int(r["origin_index"])
                         for r in csv.DictReader(open(DATA_DIR / "windows.csv"))
-                        if r["split"] == split and r["eligible_routine"] == "True"],
+                        if r["split"] == split and (r["eligible_routine"] == "True" or not routine_only)],
                        dtype=np.int64)
     targets = origins + HORIZON              # target row index for each window
     ok = targets < len(intensity)            # drop windows whose target runs past the dataset end
     origins, targets = origins[ok], targets[ok]
 
     rows = origins[:, None] + np.arange(-WINDOW + 1, 1)[None, :]   # [n, WINDOW]
-    X = np.empty(rows.shape + (len(cols), 7), dtype=np.float32)
+    X = np.empty(rows.shape + (len(cols), N_CHANNELS), dtype=np.float32)
     X[..., 0] = intensity[rows]                 # traffic intensity
     X[..., 1] = occupancy[rows]                 # occupancy
     X[..., 2] = tod_sin[rows][:, :, None]       # time-of-day, same at every node
     X[..., 3] = tod_cos[rows][:, :, None]
-    X[..., 4] = observed[rows]                  # 1 = real reading, 0 = missing/interpolated (intensity stored as 0)
+    X[..., 4] = observed[rows]                  # 1 = real reading, 0 = filled estimate
     X[..., 5] = dow_sin[rows][:, :, None]       # day-of-week, weekday vs weekend
     X[..., 6] = dow_cos[rows][:, :, None]
-    y = torch.from_numpy(intensity[targets])    # [n, N]
+    X[..., 7] = age[rows]                       # how stale a filled value is: a 15 min gap vs a 6 h gap
+    y = torch.from_numpy(intensity[targets])    # [n, N], filled where the mask is 0 (never scored)
     mask = torch.from_numpy(observed[targets])  # [n, N]
     return torch.from_numpy(X), y, mask, torch.from_numpy(targets)
 
@@ -141,19 +148,21 @@ class GTCNN(nn.Module):
     def __init__(self, S: torch.Tensor, n_sensors: int):
         super().__init__()
         self.n_sensors = n_sensors
-        self.filter1 = GraphFilter(S, 7, N_FEAT)   # channels: intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos
+        self.filter1 = GraphFilter(S, N_CHANNELS, N_FEAT)   # channels: intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos, age
         self.filter2 = GraphFilter(S, N_FEAT, N_FEAT)
         self.filter3 = GraphFilter(S, N_FEAT, N_FEAT)
+        self.filter4 = GraphFilter(S, N_FEAT, N_FEAT)
         self.head = nn.Linear(WINDOW * N_FEAT, 1)      # the same head at every node
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 7]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:        # x: [B, WINDOW, N, 8]
         z = x.reshape(x.shape[0], -1, x.shape[-1])                 # [B, WINDOW*N, C]
         z = torch.relu(self.filter1(z)) #was relu
         z = torch.relu(self.filter2(z)) #was relu
         z = torch.relu(self.filter3(z))     # [B, WINDOW*N, F]
+        z = torch.relu(self.filter4(z))     # [B, WINDOW*N, F]
         z = z.reshape(x.shape[0], WINDOW, self.n_sensors, -1)      # [B, T, N, F]
         z = z.permute(0, 2, 1, 3).flatten(2)                       # [B, N, T*F]
-        # residual on persistence: current scaled intensity (missing = 0 = sensor mean) + learned change
+        # residual on persistence: current scaled intensity (filled if missing) + learned change
         return x[:, -1, :, 0] + self.head(z).squeeze(-1)           # [B, N]
 
 
@@ -200,7 +209,31 @@ def run_epoch(model, X, y, mask, optimizer=None):
     return total / count
 
 
+def save_result(model_name: str, mae: float, rmse: float):
+    """Write this run's test score to reports/graph_results.csv (same columns as the RQ1 baselines),
+    replacing any earlier run of the same model and horizon."""
+    if DISTRICT is not None:
+        model_name += f" (district {DISTRICT})"
+    path = DATA_DIR / "reports" / "graph_results.csv"
+    fields = ["split", "model", "horizon_min", "MAE", "RMSE"]
+    rows = list(csv.DictReader(open(path))) if path.exists() else []
+    rows = [r for r in rows if (r["model"], int(r["horizon_min"])) != (model_name, HORIZON * 15)]
+    rows.append({"split": "test", "model": model_name, "horizon_min": HORIZON * 15, "MAE": mae, "RMSE": rmse})
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  saved to {path}")
+
+
 def main():
+    global HORIZON, EPOCHS
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--horizon", type=int, default=HORIZON, help="steps ahead, 1..4 (15 min each)")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    args = parser.parse_args()
+    HORIZON, EPOCHS = args.horizon, args.epochs
+
     torch.manual_seed(0) # reproducible starting point for model weights
     device = torch.device(
         "cuda" if torch.cuda.is_available()
@@ -224,20 +257,20 @@ def main():
 
     # load data in train/val/test splits
     # kept on the CPU: at WINDOW = 6 the full graph's windows are ~6.5 GB, run_epoch moves batches to the device
-    data = {s: load_split_tensors(cols, s) for s in ("train", "val", "test")}
+    # train/val on routine windows only; test on every window, so the score matches the RQ1 baselines
+    data = {s: load_split_tensors(cols, s, routine_only=s != "test") for s in ("train", "val", "test")}
     print("device:", device)
     print(district_label(), "with", n_sensors, "sensors")
 
     # n = number of windows, N = number of sensors, 
-    # 7 features per node (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos)
-    # X [n, WINDOW, N, 7] input windows
+    # 8 features per node (intensity, occupancy, tod_sin, tod_cos, observed, dow_sin, dow_cos, age)
+    # X [n, WINDOW, N, 8] input windows
     # y [n, N] intensity at HORIZON steps ahead
     # mask [n, N] ground truth mask (1 = observed, 0 = missing) -> dont use missing targets to predict on
     # targets [n] row indices of the target timestep for each window
     for s, (X, y, mask, targets) in data.items():
         missing = (~mask).sum().item()
         print(s, "windows:", len(X), "missing targets:", missing, "of", mask.numel())
-        assert (y[~mask] == 0).all(), f"{s}: missing targets should be stored as 0"
         assert torch.isfinite(X).all() and torch.isfinite(y).all(), f"{s}: non-finite data"
 
     model = GTCNN(S_product.to(device), n_sensors).to(device)
@@ -253,7 +286,8 @@ def main():
 
     # hyperparameters
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=LR_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=LR_FACTOR, patience=LR_PATIENCE, threshold=MIN_DELTA, threshold_mode="abs")
 
     # train loop
     best_val, best_epoch, best_state = float("inf"), 0, None
@@ -262,14 +296,14 @@ def main():
         t0 = time.perf_counter()
         tr = run_epoch(model, *data["train"][:3], optimizer)
         va = run_epoch(model, *data["val"][:3])
-        scheduler.step()
+        scheduler.step(va)
 
         # keep the weights with the lowest val loss
         if va < best_val - MIN_DELTA:
             best_val, best_epoch = va, epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         print(f"epoch {epoch:2d}  train {LOSS} {tr:.4f}  val {LOSS} {va:.4f}"
-              f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
+              f"  {time.perf_counter() - t0:.1f}s/epoch  lr {optimizer.param_groups[0]['lr']:.1e}",
               flush=True)
 
         # early stopping: no real val improvement for PATIENCE epochs
@@ -293,14 +327,14 @@ def main():
     with torch.no_grad():
         pred = torch.cat([model(X_test[b:b + BATCH_SIZE].to(device)) for b in range(0, len(X_test), BATCH_SIZE)])
     y, mask = y.to(device), mask.to(device)
-    X_now = X_test[:, -1].to(device)                          # [n, N, 7] last input step, for persistence
+    X_now = X_test[:, -1].to(device)                          # [n, N, 8] last input step, for persistence
 
     # convert back to vehicles/hour
     pred = pred * std + mean
     y_phys = y * std + mean
 
     # persistence baseline: predict the current reading (last timestep of the input window) for every target,
-    # scored only where that current reading is observed (a missing one is stored as 0 = the mean)
+    # scored only where that current reading is observed (a missing one holds the fill, not a measurement)
     now = X_now[..., 0] * std + mean
     mask_now = mask & (X_now[..., 4] > 0.5)
 
@@ -313,6 +347,7 @@ def main():
     for name, p_, m_, subset in rows:
         print(f"  {name:<12} {masked_rmse(p_, y_phys, m_).item():8.2f} {masked_mae(p_, y_phys, m_).item():8.2f}"
               f" {m_.sum().item():9d}  {subset}")
+    save_result("GTCNN", masked_mae(pred, y_phys, mask).item(), masked_rmse(pred, y_phys, mask).item())
 
     # ----------------- figures: 10 sensors, prediction vs truth, last week of the test set
     z = np.load(DATA_DIR / "features.npz")

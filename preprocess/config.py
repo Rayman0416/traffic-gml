@@ -107,9 +107,20 @@ OCCUPANCY_MAX_PERCENT = 100.0
 # Causal filling
 # --------------------------------------------------------------------------
 
-FFILL_MAX_STEPS = 4           # carry a genuine observation at most 1 hour
+# Masked input cells are estimated in residual space, r = (level - profile) / s,
+# where level is log1p(veh/h) for intensity and percent for occupancy.  The
+# estimate blends graph neighbours' genuine residuals at the same step with the
+# sensor's own last genuine residual decayed AR(1)-style; both are causal.
+# "none" writes FEATURE_MISSING_VALUE into masked cells instead.
+FILL_METHOD = "graph_ar"
 PROFILE_MIN_SUPPORT = 4       # observations needed per (sensor, time-of-week)
 AGE_CLIP_STEPS = 96           # cap the elapsed-time feature at one day
+FILL_MIN_EDGE_CORR = 0.5      # training residual correlation an edge needs (chosen with fill_eval)
+FILL_MIN_EDGE_OVERLAP = 672   # jointly observed training steps (one week) to trust an edge
+FILL_MIN_NEIGHBOURS = 2       # genuine neighbours needed for a spatial estimate
+FILL_LOOKBACK_STEPS = 96      # the own-history term reads back at most one day
+FILL_RESID_CLIP = 5.0         # clip residuals (in residual stds) before they are used
+FILL_MIN_RESID_STD = 0.05     # floor on the log-space intensity residual std
 
 # --------------------------------------------------------------------------
 # Window eligibility
@@ -161,12 +172,14 @@ class Flag:
     OCCUPANCY_NON_NUMERIC = 1 << 9   # occupancy present but not a finite number
     OCCUPANCY_OUT_OF_RANGE = 1 << 10  # occupancy outside [0, 100] percent
 
-    # GO-MO's interpolated values are accepted for now, but might have to be filled in manually in the future
-    # to prevent test leakage
+    # GO-MO's interpolated values are rejected: their interpolation likely reads
+    # the reading after the gap, which would leak the future into inputs and
+    # targets.  They are refilled causally by the `fill` module instead.
 
     # Traffic intensity rejecting flags
     REJECTING = (
         RAW_MISSING
+        | INTENSITY_INTERPOLATED
         | READ_ERROR
         | NON_NUMERIC
         | DUPLICATE_CONFLICT
@@ -177,6 +190,7 @@ class Flag:
     # Occupancy rejecting flags
     OCCUPANCY_REJECTING = (
         RAW_MISSING
+        | OCCUPANCY_INTERPOLATED
         | READ_ERROR
         | DUPLICATE_CONFLICT
         | OCCUPANCY_NON_NUMERIC
@@ -210,14 +224,18 @@ class Flag:
 
 class FillSource:
     OBSERVED = 0        # genuine observation
-    FFILL = 1           # forward-filled from a recent genuine observation
-    PROFILE = 2         # sensor time-of-week profile (training)
-    SENSOR_MEAN = 3     # sensor training mean (profile had no support)
-    GLOBAL_MEAN = 4     # global training mean (sensor had no training data)
+    SPATIOTEMPORAL = 1  # blend of graph neighbours and the sensor's own recent past
+    SPATIAL = 2         # graph neighbours at the same step only
+    OWN_DECAY = 3       # the sensor's own last observation, decayed toward the profile
+    PROFILE = 4         # sensor time-of-week profile (training)
+    SENSOR_MEAN = 5     # sensor training mean (profile had no support)
+    GLOBAL_MEAN = 6     # global training mean (sensor had no training data)
 
     NAMES = {
         OBSERVED: "observed",
-        FFILL: "ffill",
+        SPATIOTEMPORAL: "spatiotemporal",
+        SPATIAL: "spatial",
+        OWN_DECAY: "own_decay",
         PROFILE: "time_of_week_profile",
         SENSOR_MEAN: "sensor_train_mean",
         GLOBAL_MEAN: "global_train_mean",
@@ -243,7 +261,9 @@ RECORDED_SETTINGS = (
     "REJECT_NEGATIVE", "HARD_CAP_VEH_PER_HOUR",
     "OCCUPANCY_MIN_PERCENT", "OCCUPANCY_MAX_PERCENT",
     # causal filling
-    "FFILL_MAX_STEPS", "PROFILE_MIN_SUPPORT", "AGE_CLIP_STEPS",
+    "FILL_METHOD", "PROFILE_MIN_SUPPORT", "AGE_CLIP_STEPS",
+    "FILL_MIN_EDGE_CORR", "FILL_MIN_EDGE_OVERLAP", "FILL_MIN_NEIGHBOURS",
+    "FILL_LOOKBACK_STEPS", "FILL_RESID_CLIP", "FILL_MIN_RESID_STD",
     # window eligibility
     "MIN_INPUT_AVAILABILITY", "MIN_DISTRICT_INPUT_AVAILABILITY",
     # scaling

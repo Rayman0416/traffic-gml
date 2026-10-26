@@ -24,11 +24,12 @@ def _ts(t):
 def genuine_filter():
     """
     Returns rows that are not flagged as read errors or outside the hard cap.
-    Interpolated intensities are accepted, matching ``Flag.REJECTING``.
+    GO-MO interpolated intensities are rejected, matching ``Flag.REJECTING``.
     """
     return (
         pc.field("traffic_intensity").is_valid()
         & ~raw.read_error_expr()
+        & ~raw.intensity_interpolated_expr()
         & (pc.field("traffic_intensity") >= 0)
         & (pc.field("traffic_intensity") <= C.HARD_CAP_VEH_PER_HOUR)
     )

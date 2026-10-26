@@ -6,7 +6,6 @@ from . import config as C
 from . import splits, timeline
 
 
-# TO:DO can be used for filling missing values, but not used in the current pipeline
 def fit_profile(observed: np.ndarray, mask: np.ndarray,
                 index: pd.DatetimeIndex) -> dict:
     """
@@ -116,10 +115,19 @@ def inverse_transform(z: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.nd
 def build(observed: np.ndarray, mask: np.ndarray, index: pd.DatetimeIndex,
           sensor_ids: np.ndarray, observed_occupancy: np.ndarray,
           occupancy_mask: np.ndarray, out_dir=C.OUT_DIR, verbose=True) -> dict:
-    """Fit and save the per-sensor profile and standardisation parameters."""
+    """Fit and save the per-sensor profile, standardisation and fill parameters."""
+    from . import fill, graphs
+
     prof = fit_profile(observed, mask, index)
     scal = fit_scaler(observed, mask, index)
     occ = fit_scaler(observed_occupancy, occupancy_mask, index, min_std=C.MIN_STD_OCCUPANCY_PERCENT)
+
+    # fill parameters for each channel, fitted on the route graph's edges
+    edges = graphs.load_full_edges(out_dir)
+    arrays = {"intensity": (observed, mask), "occupancy": (observed_occupancy, occupancy_mask)}
+    fills = {}
+    for ch, (_, _, log, _, min_std) in fill.CHANNELS.items():
+        fills[ch] = fill.fit_fill_params(*arrays[ch], index, edges, log=log, min_std=min_std)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -133,12 +141,14 @@ def build(observed: np.ndarray, mask: np.ndarray, index: pd.DatetimeIndex,
         scaler_std=scal["std"],
         occupancy_scaler_mean=occ["mean"],
         occupancy_scaler_std=occ["std"],
+        **{f"fill_{ch}_{k}": fp[k] for ch, fp in fills.items() for k in fill.PARAM_KEYS},
     )
 
     summary = {
         "profile": prof["info"],
         "scaler": scal["info"],
         "occupancy_scaler": occ["info"],
+        "fill": {ch: fp["info"] for ch, fp in fills.items()},
         "split_used": splits.describe()["train"],
     }
 
@@ -149,6 +159,9 @@ def build(observed: np.ndarray, mask: np.ndarray, index: pd.DatetimeIndex,
               f"{prof['info']['n_profile_cells']:,} cells unsupported; "
               f"scaler: {scal['info']['n_sensors_std_floored']} std floored, "
               f"occupancy scaler: {occ['info']['n_sensors_std_floored']} floored")
+        for ch, fp in fills.items():
+            print(f"  {ch} fill: kept {fp['info']['n_edges_kept']:,} of "
+                  f"{fp['info']['n_candidate_edges']:,} edges")
         
     return summary
 

@@ -77,7 +77,6 @@ def build(out_dir=C.OUT_DIR, verbose=True) -> dict:
         "observed": _read(rdir / "observed_summary.json"),
         "cleaning": _read(rdir / "cleaning_report.json"),
         "params": _read(rdir / "params_summary.json"),
-        "fill": _read(rdir / "fill_summary.json"),
         "features": _read(rdir / "features_summary.json"),
         "windows": _read(rdir / "windows_summary.json"),
         "checks": _read(rdir / "checks_report.json"),
@@ -131,7 +130,7 @@ def _write_markdown(r: dict, path) -> None:
     s = r["stages"]
     obs = s.get("observed") or {}
     win = s.get("windows") or {}
-    fil = s.get("fill") or {}
+    fil = ((s.get("features") or {}).get("fill_source_fractions") or {}).get("intensity") or {}
     chk = s.get("checks") or {}
     reg = s.get("sensor_selection") or {}
     aud = s.get("audit") or {}
@@ -195,12 +194,13 @@ def _write_markdown(r: dict, path) -> None:
              f"max {g['longest_gap_per_sensor']['max']} steps")
     L.append("")
 
-    L.append("## Model inputs (causal fill)\n")
-    L.append("| Source | Share |")
-    L.append("|---|---|")
-    for k, v in (fil.get("fill_source_fractions") or {}).items():
-        L.append(f"| `{k}` | {v:.2%} |")
-    L.append("")
+    if fil:
+        L.append("## Model inputs (causal intensity fill)\n")
+        L.append("| Source | Share |")
+        L.append("|---|---|")
+        for k, v in fil.items():
+            L.append(f"| `{k}` | {v:.2%} |")
+        L.append("")
 
     feat = s.get("features") or {}
     if feat:

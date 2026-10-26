@@ -38,13 +38,17 @@ target_indexes = [f"target_index_{h}" for h in horizons]
 
 train_w = windows[windows["split"] == "train"]
 test_w = windows[windows["split"] == "test"]
+val_w = windows[windows["split"] == "val"]
 
 train_origins = train_w["origin_index"].to_numpy()
 train_targets = train_w[target_indexes].to_numpy()      
-train_origins, train_targets = train_origins[::10], train_targets[::10]  # train only every 10th window to make it quicker
+# train_origins, train_targets = train_origins[::10], train_targets[::10]  # train only every 10th window to make it quicker
 
 test_origins = test_w["origin_index"].to_numpy()
 test_targets = test_w[target_indexes].to_numpy()
+
+val_origins = val_w["origin_index"].to_numpy()
+val_targets = val_w[target_indexes].to_numpy()
 
 nbr_features = 1 + 1 + nbr_timestamps 
 
@@ -87,7 +91,8 @@ def _create_input(origins, targets):
             torch.tensor(stds, dtype=torch.float32).unsqueeze(1))
 
 X_train, y_train, measured_train, std_train = _create_input(train_origins, train_targets)  
-X_eval, y_eval, measured_eval, std_eval = _create_input(test_origins, test_targets)
+X_test, y_test, measured_test, std_test = _create_input(test_origins, test_targets)
+X_val, y_val, measured_val, std_val = _create_input(val_origins, val_targets)
 
 def loss_fn(pred, y, measured):
     return ((pred - y).abs() * measured).sum() / measured.sum().clamp(min=1.0)
@@ -97,12 +102,11 @@ opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
 n_train = len(X_train)
+lowest_mae = float("inf")
+best_state = None
 
 for epoch in range(epochs):
     model.train()
-    total_mae = 0.0
-    total_mse = 0.0
-    total_n = 0.0
     order = torch.randperm(n_train)                     
 
     for i in range(0, n_train, batch_size):
@@ -115,23 +119,39 @@ for epoch in range(epochs):
         loss.backward()
         opt.step()
 
-        errors = predictions - y_batch
-        total_mae += (errors.abs() * measured_batch).sum().item()
-        total_mse += ((errors ** 2) * measured_batch).sum().item()
-        total_n += measured_batch.sum().item()
+    # evaluatoin on validation set
+    model.eval()
+    with torch.no_grad():
+        predictions = model(X_val)
 
-    print(f"Epoch {epoch + 1}/{epochs}, "
-          f"Training MAE: {total_mae / total_n:.4f}, training MSE: {total_mse / total_n:.4f}")
+        errors = predictions - y_val
+        val_mae = ((errors.abs() * measured_val).sum() / measured_val.sum().clamp(min=1.0)).item()
+        val_rmse = (((errors.square() * measured_val).sum() / measured_val.sum().clamp(min=1.0)).sqrt()).item()
 
+    print(
+        f"Epoch {epoch + 1}/{epochs}, "
+        f"Validation MAE: {val_mae:.4f}, "
+        f"Validation RMSE: {val_rmse:.4f}"
+    )
+
+    if val_mae < lowest_mae:
+        lowest_mae = val_mae
+        best_state = {
+            key: value.detach().clone()
+            for key, value in model.state_dict().items()
+        }
+
+# save checkpoints
+model.load_state_dict(best_state)
 
 model.eval()
 with torch.no_grad():
-    predictions = model(X_eval)
+    predictions = model(X_test)
 
-err = (predictions - y_eval) * std_eval        
+err = (predictions - y_test) * std_test        
 
 print(f"\nEvaluation results for {nbr_sensors} sensors (test):")
 for k, minutes in enumerate(horizons.values()):
-    e = err[:, k][measured_eval[:, k].bool()]             
+    e = err[:, k][measured_test[:, k].bool()]             
     print(f"{minutes} min:  MAE {e.abs().mean().item():.1f}  "
           f"RMSE {e.pow(2).mean().sqrt().item():.1f} veh/h   (n = {len(e)})")

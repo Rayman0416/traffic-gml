@@ -25,14 +25,14 @@ DATA_DIR = Path("data/forecast_dataset")
 DISTRICTS = None  # None = every district in graph
 WINDOW = 6  # input window in timesteps
 HORIZONS = (1, 2, 3, 4)  # predicted at once: 15, 30, 45, 60 min ahead
-C_TAPS = 2  # graph filter order (number of taps); 1 = self only
+C_TAPS = 3  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
 N_FEAT = 12  # features before concat and graph filter. 8-12 is good
 HIDDEN = 12  # features after concat, these are much cheaper. Maybe we add some extra layers here?
 DISTRICT_K = 5  # District node picks this many nodes using attention
 ATTN = "district"  # "district", "shared" (neighbours only) or "none" (plain GTCNN). --attn on the command line
 
-EPOCHS = 500        # upper bound; early stopping on validation can stop earlier
+EPOCHS = 1000       # upper bound; early stopping on validation can stop earlier
 PATIENCE = 25       # stop after this many epochs without val improvement
 MIN_DELTA = 0.01    # vehicles/hour; smaller val improvements do not count
 LR = 5e-2           # learning rate

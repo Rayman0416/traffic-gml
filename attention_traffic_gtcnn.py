@@ -22,7 +22,7 @@ matplotlib.use("Agg")
 Hyper-Perameters with explination
 """
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICTS = None  # None = every district in graph
+DISTRICTS = None  # None = every district in the dataset
 WINDOW = 6  # input window in timesteps
 HORIZONS = (1, 2, 3, 4)  # predicted at once: 15, 30, 45, 60 min ahead
 C_TAPS = 3  # graph filter order (number of taps); 1 = self only
@@ -45,7 +45,9 @@ Less hyper perameters probalby do not change
 COMPILE = True  # one compiled graph per district size
 BATCH_SIZE = int(2 ** 10) # How to batch
 PLOT_FIGURES = False  # False skips the 10 figures per district, good for debug
-N_CHANNELS = 4  # intensity, occupancy, tod_sin, sin(pi*t/96)^2
+TIME_FEATURES = ("tod_sin", "tod_cos", "dow_sin", "dow_cos")  # from features.npz time_features
+INPUT_CHANNELS = ("intensity", "occupancy", "intensity_mask", "intensity_age") + TIME_FEATURES  # last axis of X
+N_CHANNELS = len(INPUT_CHANNELS)
 
 MODEL_NAMES = {"district": "GTCNN + district attention",
                "shared": "GTCNN + neighbour attention",
@@ -91,9 +93,7 @@ def shared_data():
     t0 = time.perf_counter()
     z = np.load(DATA_DIR / "features.npz")
     names = list(z["time_feature_names"])
-    tf = z["time_features"]
-    tod_sin = tf[:, names.index("tod_sin")].astype(np.float32)
-    day_sin2 = (np.sin(np.pi * np.arange(len(tf)) / 96.0) ** 2).astype(np.float32)
+    tf = z["time_features"][:, [names.index(n) for n in TIME_FEATURES]].astype(np.float32)  # [T, 4]
 
     # every window of each split, like the baselines (not only the routine ones)
     with open(DATA_DIR / "windows.csv") as f:
@@ -103,12 +103,12 @@ def shared_data():
     p = np.load(DATA_DIR / "params.npz")
 
     sh = dict(intensity=z["intensity"].astype(np.float32), observed=z["intensity_mask"].astype(bool),
-              occupancy=z["occupancy"].astype(np.float32), time=np.stack([tod_sin, day_sin2], axis=1),
+              occupancy=z["occupancy"].astype(np.float32), age=z["intensity_age"].astype(np.float32), time=tf,
               origins=origins, mean=p["scaler_mean"].astype(np.float32), std=p["scaler_std"].astype(np.float32),
               timestamps=z["timestamps"], sensor_ids=z["sensor_ids"])
     first = min(o.min() for o in origins.values())
     last = max(o.max() for o in origins.values()) + max(HORIZONS)
-    assert first >= WINDOW - 1 and last < len(tod_sin), "a window reaches outside the year"
+    assert first >= WINDOW - 1 and last < len(tf), "a window reaches outside the year"
     print(f"  shared data loaded once in {time.perf_counter() - t0:.1f}s")
     return sh
 
@@ -126,6 +126,7 @@ class District:
         self.reach = neighbourhood(self.S, A_TAPS)  # [N, N]
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a[:, self.cols])).to(device)
         self.intensity, self.occupancy, self.observed = t(sh["intensity"]), t(sh["occupancy"]), t(sh["observed"])
+        self.age = t(sh["age"])  # steps since the last real reading / 96, 0 = real now
         self.mean = torch.from_numpy(sh["mean"][self.cols]).to(device)
         self.std = torch.from_numpy(sh["std"][self.cols]).to(device)
         self.origins = {s: torch.from_numpy(o).to(device) for s, o in sh["origins"].items()}
@@ -137,12 +138,14 @@ def window_offsets(device):
 
 
 def gather(dist: District, time_feats: torch.Tensor, origins: torch.Tensor):
-    """origins [B] -> X [B, WINDOW, N, 4] inputs, y [B, N, H] standardised targets, mask [B, N, H]."""
+    """origins [B] -> X [B, WINDOW, N, C] inputs (INPUT_CHANNELS), y [B, N, H] standardised targets,
+    mask [B, N, H]."""
     hist, ahead = window_offsets(origins.device)
     rows = origins[:, None] + hist  # [B, WINDOW]
     B, N = len(origins), dist.n
     X = torch.cat([dist.intensity[rows][..., None], dist.occupancy[rows][..., None],
-                   time_feats[rows][:, :, None, :].expand(B, WINDOW, N, 2)], dim=-1)
+                   dist.observed[rows][..., None].float(), dist.age[rows][..., None],
+                   time_feats[rows][:, :, None, :].expand(B, WINDOW, N, len(TIME_FEATURES))], dim=-1)
     targets = origins[:, None] + ahead  # [B, H]
     y = dist.intensity[targets].transpose(1, 2)
     mask = dist.observed[targets].transpose(1, 2)
@@ -159,11 +162,11 @@ def load_all(device):
 
 def save_checkpoint(model, path, trained_districts, best_epoch, seed):
     ckpt = dict(
-        format=2,
+        format=3,  # 3: 8 input channels and output = latest reading + change
         state_dict={k: v.detach().cpu() for k, v in model.state_dict().items()},   # weights only, no graph buffers
         config=dict(WINDOW=WINDOW, HORIZONS=list(HORIZONS), C_TAPS=C_TAPS, A_TAPS=A_TAPS, N_FEAT=N_FEAT,
                     HIDDEN=HIDDEN, attn=model.attn_kind, k=getattr(model.attn, "k", None)),
-        input_channels=["intensity", "occupancy", "tod_sin", "day_sin2"],   # last axis of X, in order
+        input_channels=list(INPUT_CHANNELS),   # last axis of X, in order
         trained_districts=list(trained_districts),
         best_epoch=best_epoch, seed=seed,
         torch=str(torch.__version__),                    # str(): the raw version object can't be loaded safely
@@ -175,7 +178,7 @@ def save_checkpoint(model, path, trained_districts, best_epoch, seed):
 def load_trained(path, device="cpu"):
     """Checkpoint -> model (eval mode), plus every district and the time features on `device`."""
     ckpt = torch.load(path, map_location="cpu", weights_only=True)     # plain tensors/dicts only: safe to load
-    assert ckpt.get("format") == 2, "checkpoint is from the old one-horizon version of this file"
+    assert ckpt.get("format") == 3, "checkpoint is from an older version of this file (other inputs/outputs)"
     cfg = ckpt["config"]
     mine = dict(WINDOW=WINDOW, HORIZONS=list(HORIZONS), C_TAPS=C_TAPS, A_TAPS=A_TAPS, N_FEAT=N_FEAT, HIDDEN=HIDDEN)
     bad = {k: (cfg[k], mine[k]) for k in mine if cfg[k] != mine[k]}
@@ -279,14 +282,15 @@ class GTCNN(nn.Module):
         self.fc2 = nn.Linear(HIDDEN, HIDDEN)  # <-- extra hidden layer
         self.head = nn.Linear(HIDDEN, len(HORIZONS))  # the same head at every node, one output per horizon
 
-    def forward(self, x: torch.Tensor, S: torch.Tensor, reach: torch.Tensor) -> torch.Tensor:  # x: [B, WINDOW, N, 4]
+    def forward(self, x: torch.Tensor, S: torch.Tensor, reach: torch.Tensor) -> torch.Tensor:  # x: [B, WINDOW, N, C]
+        last = x[:, -1, :, :1]  # [B, N, 1] latest intensity, before attention changes x
         if self.attn is not None:
-            x = self.attn(x, reach)  # [B, T, N, 4]
+            x = self.attn(x, reach)  # [B, T, N, C]
         z = torch.relu(self.filter1(x, S))  # [B, T, N, F]
         z = z.permute(0, 2, 1, 3).flatten(2)  # [B, N, T*F]
         z = torch.relu(self.fc(z))  # <-- hidden layer + activation
         z = torch.relu(self.fc2(z))
-        return self.head(z)  # [B, N, H]
+        return last + self.head(z)  # [B, N, H] latest reading + predicted change per horizon
 
 
 def masked_mae(pred, y, mask):

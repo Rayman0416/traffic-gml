@@ -27,15 +27,15 @@ WINDOW = 6  # input window in timesteps
 HORIZONS = (1, 2, 3, 4)  # predicted at once: 15, 30, 45, 60 min ahead
 C_TAPS = 3  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
-N_FEAT = 12  # features before concat and graph filter. 8-12 is good
-HIDDEN = 12  # features after concat, these are much cheaper. Maybe we add some extra layers here?
+N_FEAT = 32  # features before concat and graph filter. 8-12 is good
+HIDDEN = 64  # features after concat, these are much cheaper. Maybe we add some extra layers here?
 DISTRICT_K = 5  # District node picks this many nodes using attention
 ATTN = "district"  # "district", "shared" (neighbours only) or "none" (plain GTCNN). --attn on the command line
 
 EPOCHS = 1000       # upper bound; early stopping on validation can stop earlier
 PATIENCE = 25       # stop after this many epochs without val improvement
 MIN_DELTA = 0.01    # vehicles/hour; smaller val improvements do not count
-LR = 5e-2           # learning rate
+LR = 1e-3           # learning rate
 Gamma_LR = 0.985    # LR = LR * Gamma_LR ** epochs. An epoch is now one pass over every district
 SEED = 0
 
@@ -280,6 +280,7 @@ class GTCNN(nn.Module):
         self.filter1 = StructuredGraphFilter(N_CHANNELS, N_FEAT)
         self.fc = nn.Linear(WINDOW * N_FEAT, HIDDEN)  # <-- extra hidden layer
         self.fc2 = nn.Linear(HIDDEN, HIDDEN)  # <-- extra hidden layer
+        self.fc3 = nn.Linear(HIDDEN, HIDDEN)  # <-- extra hidden layer
         self.head = nn.Linear(HIDDEN, len(HORIZONS))  # the same head at every node, one output per horizon
 
     def forward(self, x: torch.Tensor, S: torch.Tensor, reach: torch.Tensor) -> torch.Tensor:  # x: [B, WINDOW, N, C]
@@ -290,6 +291,7 @@ class GTCNN(nn.Module):
         z = z.permute(0, 2, 1, 3).flatten(2)  # [B, N, T*F]
         z = torch.relu(self.fc(z))  # <-- hidden layer + activation
         z = torch.relu(self.fc2(z))
+        z = torch.relu(self.fc3(z))
         return last + self.head(z)  # [B, N, H] latest reading + predicted change per horizon
 
 

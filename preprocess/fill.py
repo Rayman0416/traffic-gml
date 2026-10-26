@@ -26,6 +26,8 @@ from scipy import sparse
 from . import config as C
 from . import params, splits, timeline
 from .config import FillSource
+from . import graphs, sensor_selection
+from . import observed as observed_mod
 
 # channel -> (observed key, mask key, log level, upper clip, residual std floor)
 CHANNELS = {
@@ -345,8 +347,6 @@ def evaluate(out_dir=C.OUT_DIR, n_gaps=20000, n_outages=40, outage_steps=8,
     whole-district outages. Errors are in veh/h, split by gap age and by how busy
     the sensor normally is (quiet street vs. highway).
     """
-    from . import graphs, sensor_selection
-    from . import observed as observed_mod
 
     obs = observed_mod.load(out_dir)
     p = params.load(out_dir)

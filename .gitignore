@@ -7,4 +7,8 @@ __pycache__/
 .DS_Store
 figures/
 rq1/forecast_dataset/
+checkpoints/
 
+
+# committed results (the *.csv rule above would hide them)
+!results/**/*.csv

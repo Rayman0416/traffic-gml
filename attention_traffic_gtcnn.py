@@ -53,6 +53,7 @@ Less hyper perameters probalby do not change
 """
 COMPILE = True  # one compiled graph per district size
 BATCH_SIZE = int(2 ** 8)  # origins per step; every district runs on the same origins
+GPU_MARGIN_GB = 0.3  # the allocator is capped at the free GPU memory minus this (see main)
 PLOT_FIGURES = False  # False skips the 10 figures per district, good for debug
 TIME_FEATURES = ("tod_sin", "tod_cos", "dow_sin", "dow_cos")  # from features.npz time_features
 INPUT_CHANNELS = ("intensity", "occupancy", "intensity_mask", "intensity_age") + TIME_FEATURES  # last axis of X
@@ -413,6 +414,37 @@ def chunked_linear(x, W, bias, chunks=512):  # x [..., K], W [F_out, K]
 
 # --------------------------------------------------------------- city forward pass
 
+CHUNK = BATCH_SIZE  # origins per forward pass, halved after an out-of-memory error
+
+
+def out_of_memory(e: BaseException) -> bool:
+    """True for an out-of-memory error, also when wrapped (torch.compile raises it as BackendCompilerFailed)."""
+    while e is not None:
+        if isinstance(e, torch.OutOfMemoryError):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def chunked(o, step, reset):
+    """Run step(chunk) over the origins o in chunks of CHUNK. After an out-of-memory error: reset(),
+    halve CHUNK and start o over. Losses and scores are sums over origins, so the chunk size only
+    changes memory and time, never the result (a batch is still BATCH_SIZE origins per optimizer step)."""
+    global CHUNK
+    while True:
+        try:
+            for c in range(0, len(o), CHUNK):
+                step(o[c:c + CHUNK])
+            return
+        except Exception as e:
+            if CHUNK == 1 or not out_of_memory(e):
+                raise
+        reset()  # outside the except, so the failed pass's tensors are already freed
+        torch.cuda.empty_cache()
+        CHUNK //= 2
+        print(f"  out of GPU memory: {CHUNK} origins per forward pass from now on", flush=True)
+
+
 def talks(model, city) -> bool:
     return model.router.k > 0 and len(city.districts) > 1
 
@@ -481,18 +513,24 @@ def train_epoch(model, city, optimizer, gen, encode, exchange="detached"):
     for b in range(0, len(o), BATCH_SIZE):
         ob = o[b:b + BATCH_SIZE]
         n_targets = sum(d.observed[ob[:, None] + ahead].sum() for d in city.districts).clamp(min=1)
+        losses = []
+
+        def step(oc):  # gradients add up over the chunks of the batch
+            if exchange == "full":
+                loss = sum(((p - y).abs() * m).sum() for p, y, m in city_outputs(model, city, oc, encode, "full"))
+                loss = loss / n_targets
+                loss.backward()
+                losses.append(loss.detach())
+            else:
+                for p, y, m in city_outputs(model, city, oc, encode):
+                    loss = ((p - y).abs() * m).sum() / n_targets
+                    loss.backward()  # gradients add up over the districts, memory is freed per district
+                    losses.append(loss.detach())
+
         optimizer.zero_grad()
-        if exchange == "full":
-            loss = sum(((p - y).abs() * m).sum() for p, y, m in city_outputs(model, city, ob, encode, "full"))
-            loss = loss / n_targets
-            loss.backward()
-            total += loss.detach()
-        else:
-            for p, y, m in city_outputs(model, city, ob, encode):
-                loss = ((p - y).abs() * m).sum() / n_targets
-                loss.backward()  # gradients add up over the districts, memory is freed per district
-                total += loss.detach()
+        chunked(ob, step, reset=lambda: (optimizer.zero_grad(), losses.clear()))
         optimizer.step()
+        total += sum(losses)
         n_steps += 1
     return (total / n_steps).item()  # one sync per epoch
 
@@ -503,16 +541,20 @@ def score(model, city, split, encode=None):
     model.eval()
     encode = encode or model.encode
     D, H = len(city.districts), len(HORIZONS)
-    abs_sum = torch.zeros(D, H, device=city.time.device, dtype=torch.float64)
-    sq_sum, count = abs_sum.clone(), abs_sum.clone()
+    sums = torch.zeros(3, D, H, device=city.time.device, dtype=torch.float64)  # abs, squared, count
     o = city.origins[split]
-    for b in range(0, len(o), BATCH_SIZE):
-        for di, (pred, y, mask) in enumerate(city_outputs(model, city, o[b:b + BATCH_SIZE], encode)):
+
+    def add(part, oc):
+        for di, (pred, y, mask) in enumerate(city_outputs(model, city, oc, encode)):
             m = mask.double()
             err = ((pred - y) * city.districts[di].std[None, :, None]).double() * m  # veh/h, the mean cancels
-            abs_sum[di] += err.abs().sum((0, 1))
-            sq_sum[di] += err.square().sum((0, 1))
-            count[di] += m.sum((0, 1))
+            part[:, di] += torch.stack([err.abs().sum((0, 1)), err.square().sum((0, 1)), m.sum((0, 1))])
+
+    for b in range(0, len(o), BATCH_SIZE):
+        part = torch.zeros_like(sums)
+        chunked(o[b:b + BATCH_SIZE], lambda oc: add(part, oc), reset=part.zero_)
+        sums += part
+    abs_sum, sq_sum, count = sums
     per_district = {d.id: (abs_sum[i] / count[i].clamp(min=1)).tolist() for i, d in enumerate(city.districts)}
     abs_sum, sq_sum, count = abs_sum.sum(0), sq_sum.sum(0), count.sum(0)
     count_l = count.long().tolist()
@@ -531,7 +573,8 @@ def predict(model, city, di, split, encode=None):
     encode = encode or model.encode
     d = city.districts[di]
     o = city.origins[split]
-    parts = [list(city_outputs(model, city, o[b:b + BATCH_SIZE], encode))[di] for b in range(0, len(o), BATCH_SIZE)]
+    parts = []
+    chunked(o, lambda oc: parts.append(list(city_outputs(model, city, oc, encode))[di]), reset=parts.clear)
     pred, y, mask = (torch.cat(t) for t in zip(*parts))
     scale = lambda t: t * d.std[None, :, None] + d.mean[None, :, None]
     return scale(pred), scale(y), mask
@@ -552,22 +595,28 @@ def router_stats(model, city, split, path):
     model.eval()
     o = city.origins[split]
     picks, weights, sup = [], [], []
-    for b in range(0, len(o), BATCH_SIZE):
-        u, s = tokens(model, city, o[b:b + BATCH_SIZE], model.encode)
+
+    def step(oc):
+        u, s = tokens(model, city, oc, model.encode)
         model.router(u, s, city.log_w)
         idx, alpha = model.router.last
         picks.append(idx.cpu()), weights.append(alpha.cpu()), sup.append(s.cpu())
+
+    chunked(o, step, reset=lambda: (picks.clear(), weights.clear(), sup.clear()))
     ids = np.array([d.id for d in city.districts])
     np.savez(path, district_ids=ids, origins=o.cpu().numpy(), picks=ids[torch.cat(picks).numpy()],
              weights=torch.cat(weights).numpy(), support=torch.cat(sup).numpy())
     print(f"  router picks: {path}")
 
 
-def save_result(model_name: str, seed: int, results: dict):
+COST_FIELDS = ["n_params", "epochs", "train_s", "epoch_s", "infer_s", "peak_gb"]  # same columns as rq1/NN.py
+
+
+def save_result(model_name: str, seed: int, results: dict, cost: dict):
     """Write this run's val and test scores to reports/graph_results.csv (same columns as the RQ1
-    baselines, plus the seed), replacing any earlier run of the same model and seed."""
+    baselines, plus the seed and the cost columns), replacing any earlier run of the same model and seed."""
     path = DATA_DIR / "reports" / "graph_results.csv"
-    fields = ["split", "model", "horizon_min", "MAE", "RMSE", "seed"]
+    fields = ["split", "model", "horizon_min", "MAE", "RMSE", "seed"] + COST_FIELDS
     rows = []
     if path.exists():
         with open(path) as fh:
@@ -576,9 +625,9 @@ def save_result(model_name: str, seed: int, results: dict):
     for split, (mae, rmse) in results.items():
         for h, a, s in zip(HORIZONS, mae, rmse):
             rows.append({"split": split, "model": model_name, "horizon_min": h * 15,
-                         "MAE": a, "RMSE": s, "seed": seed})
+                         "MAE": a, "RMSE": s, "seed": seed, **cost})
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer = csv.DictWriter(fh, fieldnames=fields, restval="")  # older rows have no cost columns
         writer.writeheader()
         writer.writerows(rows)
     print(f"  saved to {path}")
@@ -736,6 +785,12 @@ def main():
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
+    if device.type == "cuda":
+        # beyond the free memory the driver can spill into shared system memory (WSL/Windows), which is
+        # very slow and makes the timings meaningless: raise out-of-memory instead, so chunked() splits the batch
+        free, total = torch.cuda.mem_get_info()
+        torch.cuda.set_per_process_memory_fraction(max(0.1, (free - GPU_MARGIN_GB * 1e9) / total))
+        print(f"GPU memory cap {(free - GPU_MARGIN_GB * 1e9) / 1e9:.2f} GB of {total / 1e9:.2f} GB")
 
     city = City(device, args.partition)
     model = GTCNN(args.attn, args.k, args.router, args.gate == "on", args.prior).to(device)  # one model for every district
@@ -755,13 +810,18 @@ def main():
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=Gamma_LR)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    sync = (torch.cuda.synchronize if device.type == "cuda"
+            else torch.mps.synchronize if device.type == "mps" else (lambda: None))  # so timings are real
     best_val, best_epoch, best_state = float("inf"), 0, None
+    epoch_times = []
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
         tr = train_epoch(model, city, optimizer, gen, encode, args.exchange)
         va_mae, _, _, _ = score(model, city, "val", encode)
         va = float(np.mean(va_mae))  # model selection: val MAE in vehicles/hour, mean over horizons
+        sync()
+        epoch_times.append(time.perf_counter() - t0)  # train + val pass, like rq1/NN.py
         scheduler.step()
         if va < best_val - MIN_DELTA:
             best_val, best_epoch = va, epoch
@@ -774,9 +834,9 @@ def main():
             print(f"early stop at epoch {epoch}: no val improvement > {MIN_DELTA} veh/h for {PATIENCE} epochs")
             break
     train_seconds = time.perf_counter() - train_start
-    print(f"training time {train_seconds:.1f}s ({epoch} epochs, {train_seconds / epoch:.1f}s/epoch)")
-    if device.type == "cuda":
-        print(f"peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+    print(f"training time {train_seconds:.1f}s ({epoch} epochs, median {np.median(epoch_times):.1f}s/epoch)")
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else float("nan")
+    print(f"peak GPU memory {peak_gb:.2f} GB, {CHUNK} origins per forward pass")
 
     model.load_state_dict(best_state)  # the epoch with the best validation score, never the test score
     print(f"best val mae {best_val:.2f} veh/h at epoch {best_epoch}")
@@ -801,16 +861,23 @@ def main():
 
     # final scores with the best weights, eager (no compile)
     results = {}
-    for split in ("val", "test"):
-        mae, rmse, count, per_district = score(model, city, split)
+    for split in ("val", "test"):  # val first, so the GPU is warm when test is timed
+        sync()
+        t0 = time.perf_counter()
+        mae, rmse, count, per_district = score(model, city, split)  # predict every window and sensor
+        sync()
+        infer_seconds = time.perf_counter() - t0
         results[split] = (mae, rmse)
+    cost = dict(n_params=sum(p.numel() for p in model.parameters()), epochs=epoch, train_s=train_seconds,
+                epoch_s=float(np.median(epoch_times)), infer_s=infer_seconds, peak_gb=peak_gb)
+    print(f"test inference {infer_seconds:.2f}s for {len(city.origins['test']):,} windows")
     print(f"\n{model_name}, test, every window and sensor, genuine targets (vehicles/hour):")
     print(f"  {'horizon':>8} {'MAE':>8} {'RMSE':>8} {'targets':>10}")
     for h, a, s, c in zip(HORIZONS, *results["test"], count):
         print(f"  {h * 15:>5} min {a:8.2f} {s:8.2f} {c:10,d}")
     print(f"\n  test MAE per district: " + ", ".join(f"{k}: {v[0]:.1f}/{v[-1]:.1f}" for k, v in per_district.items())
           + f"  ({HORIZONS[0] * 15}/{HORIZONS[-1] * 15} min)")
-    save_result(model_name, args.seed, results)
+    save_result(model_name, args.seed, results, cost)
     router_stats(model, city, "test", DATA_DIR / "reports" / f"router_{slug}_seed{args.seed}.npz")
 
     if PLOT_FIGURES:

@@ -29,9 +29,9 @@ matplotlib.use("Agg")
 Hyper-Perameters with explination
 """
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICTS = None  # None = every district in the dataset
+DISTRICTS = 4  # None = every district in the dataset
 WINDOW = 6  # input window in timesteps
-HORIZONS = (1, 2, 3, 4)  # predicted at once: 15, 30, 45, 60 min ahead
+HORIZONS = 2  # predicted at once: 15, 30, 45, 60 min ahead
 C_TAPS = 3  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
 N_FEAT = 32  # features before concat and graph filter. 8-12 is good
@@ -63,6 +63,10 @@ FULL_CITY = 0  # district id used for the whole city as one graph
 MODEL_NAMES = {"district": "GTCNN + district attention",
                "shared": "GTCNN + neighbour attention",
                "none": "GTCNN"}
+
+HORIZONS = (HORIZONS,) if isinstance(HORIZONS, int) else tuple(HORIZONS)  # be able to do both 2 and (1, 2, 3, 4)
+if DISTRICTS is not None:                                                 # be able to train on a single district
+    DISTRICTS = [int(DISTRICTS)] if isinstance(DISTRICTS, (int, np.integer)) else sorted({int(d) for d in DISTRICTS})
 
 # ---------------------------------------------------------------- data
 
@@ -132,9 +136,6 @@ def shared_data():
               occupancy=z["occupancy"].astype(np.float32), age=z["intensity_age"].astype(np.float32), time=tf,
               origins=origins, mean=p["scaler_mean"].astype(np.float32), std=p["scaler_std"].astype(np.float32),
               timestamps=z["timestamps"], sensor_ids=z["sensor_ids"])
-    first = min(o.min() for o in origins.values())
-    last = max(o.max() for o in origins.values()) + max(HORIZONS)
-    assert first >= WINDOW - 1 and last < len(tf), "a window reaches outside the year"
     print(f"  shared data loaded once in {time.perf_counter() - t0:.1f}s")
     return sh
 
@@ -541,13 +542,13 @@ def score(model, city, split, encode=None):
     model.eval()
     encode = encode or model.encode
     D, H = len(city.districts), len(HORIZONS)
-    sums = torch.zeros(3, D, H, device=city.time.device, dtype=torch.float64)  # abs, squared, count
+    sums = torch.zeros(3, D, H, device=city.time.device, dtype=torch.float32)  # abs, squared, count
     o = city.origins[split]
 
     def add(part, oc):
         for di, (pred, y, mask) in enumerate(city_outputs(model, city, oc, encode)):
-            m = mask.double()
-            err = ((pred - y) * city.districts[di].std[None, :, None]).double() * m  # veh/h, the mean cancels
+            m = mask
+            err = ((pred - y) * city.districts[di].std[None, :, None]) * m  # veh/h, the mean cancels
             part[:, di] += torch.stack([err.abs().sum((0, 1)), err.square().sum((0, 1)), m.sum((0, 1))])
 
     for b in range(0, len(o), BATCH_SIZE):

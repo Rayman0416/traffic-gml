@@ -16,6 +16,8 @@
 #   python rq1/compare.py --run --seeds 0          # one seed, quicker
 #   python rq1/compare.py --run --seeds 0 --epochs 1   # check that everything runs
 #   python rq1/compare.py --data-dir data/forecast_dataset_full
+#   python rq1/compare.py --run --skip baseline nn --window 4 --n-feat 16 --hidden 32
+#       a smaller graph model: its own rows in graph_results.csv, tables in reports/W4_F16_H32/
 
 import argparse
 import json
@@ -76,6 +78,9 @@ def graph_args(flags: list):
     p.add_argument("--prior", action="store_true")
     p.add_argument("--exchange", default="detached")
     p.add_argument("--partition", default="district")
+    p.add_argument("--window", type=int, default=gt.WINDOW)
+    p.add_argument("--n-feat", type=int, default=gt.N_FEAT)
+    p.add_argument("--hidden", type=int, default=gt.HIDDEN)
     args = p.parse_args(flags)
     if args.partition == "none":
         args.k = 0  # as in the graph script: one graph, nobody to exchange with
@@ -97,7 +102,7 @@ def model_name(flags: list) -> str:
 def scalars_exchanged(flags: list) -> int:
     """Numbers each district receives per origin: K tokens, plus their support if aware."""
     a = graph_args(flags)
-    return a.k * (gt.HIDDEN + (2 if a.router == "aware" else 0))
+    return a.k * (a.hidden + (2 if a.router == "aware" else 0))
 
 
 def run_notebook(path: Path, data_dir: Path):
@@ -231,9 +236,10 @@ def rq1_paired(test: pd.DataFrame):
     print(f"  mean {mean_std(diff, 2, sign=True)}; aware router wins {(diff < 0).sum()} of {len(diff)} seeds")
 
 
-def table2(test: pd.DataFrame, reports: Path):
+def table2(test: pd.DataFrame, reports: Path, runs: dict):
     rows = {}
-    for label, flags in GROUPS["rq2"].items():
+    for label in GROUPS["rq2"]:
+        flags = runs[label]
         per_run = test[test["label"] == label].drop_duplicates("seed")
         rows[label] = {"peak_gb": per_run["peak_gb"].mean(), "epoch_s": per_run["epoch_s"].mean(),
                        "train_s": per_run["train_s"].mean(), "n_params": per_run["n_params"].mean(),
@@ -276,7 +282,7 @@ def table3(test: pd.DataFrame, reports: Path):
     write_tex(t, reports / "table3_ablation.tex", rule_after={0})
 
 
-def plot_table1(test: pd.DataFrame, order: list):
+def plot_table1(test: pd.DataFrame, order: list, path: Path):
     fig, ax = plt.subplots(figsize=(6, 4))
     for i, label in enumerate(order):
         g = test[test["label"] == label].groupby("horizon_min")["MAE"]
@@ -289,10 +295,38 @@ def plot_table1(test: pd.DataFrame, order: list):
     ax.spines[["top", "right"]].set_visible(False)
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
-    Path("figures").mkdir(exist_ok=True)
-    fig.savefig("figures/table1_mae_by_horizon.png", dpi=200)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200)
     plt.close(fig)
-    print("saved figures/table1_mae_by_horizon.png")
+    print(f"saved {path}")
+
+
+def size_table(reports: Path):
+    """Every graph model at every size it was run with, side by side (mean over seeds), plus the MLP.
+    The size is the ', W=4 F=16 H=32' suffix of the model name; no suffix is the default size."""
+    path = reports / GRAPH_FILE
+    if not path.exists():
+        return
+    df = pd.read_csv(path)
+    df = df[(df["split"] == "test") & df["seed"].notna()]
+    parts = df["model"].str.extract(r"^(.*?)(?:, (W=\d+ F=\d+ H=\d+))?$")
+    default = "W={} F={} H={}".format(*gt.DEFAULT_SIZE)
+    df = df.assign(model=parts[0], size=parts[1].fillna(default))
+    if df["size"].nunique() < 2:
+        return
+    nn = reports / "nn_results.csv"
+    if nn.exists():  # the MLP for scale: about as many parameters as the small graph models
+        m = pd.read_csv(nn)
+        df = pd.concat([df, m[m["split"] == "test"].assign(size="")], ignore_index=True)
+    mae = df[df["horizon_min"].isin([15, 60])].pivot_table(index=["model", "size"], columns="horizon_min", values="MAE")
+    mae.columns = [f"MAE {h} min" for h in mae.columns]
+    per_run = df.drop_duplicates(["model", "size", "seed"]).groupby(["model", "size"])
+    t = mae.join(per_run[["n_params", "train_s"]].mean()).join(per_run["seed"].nunique().rename("seeds"))
+    t["n_params"] = t["n_params"].round().astype("Int64")
+    print("\nGraph models at every size (test, mean over seeds), MLP for scale")
+    print(t.round(1).to_string())
+    t.round(2).to_csv(reports / "size_comparison.csv")
+    print(f"saved {reports / 'size_comparison.csv'}")
 
 
 def main():
@@ -304,27 +338,36 @@ def main():
                         help="tables to build; main = Table 1, rq2 = Table 2, ablation = Table 3")
     parser.add_argument("--data-dir", type=Path, default=Path("data/forecast_dataset"))
     parser.add_argument("--epochs", type=int, default=None, help="override the epochs, for a quick test only")
+    parser.add_argument("--window", type=int, default=gt.WINDOW, help="graph models: input timesteps")
+    parser.add_argument("--n-feat", type=int, default=gt.N_FEAT, help="graph models: graph filter features")
+    parser.add_argument("--hidden", type=int, default=gt.HIDDEN, help="graph models: hidden size")
     args = parser.parse_args()
     reports = args.data_dir / "reports"
     if not reports.exists():
         sys.exit(f"{reports} not found: run this from the repo root")
-    runs = selected_runs(args.groups)
+    size = ["--window", str(args.window), "--n-feat", str(args.n_feat), "--hidden", str(args.hidden)]
+    runs = {label: flags + size for label, flags in selected_runs(args.groups).items()}
+    tag = gt.size_suffix(args, "").replace("=", "").replace(" ", "_")  # "" for the default size
+    out = reports / tag if tag else reports  # another size never overwrites the default tables
+    out.mkdir(exist_ok=True)
+    figure = Path("figures") / (f"table1_mae_by_horizon_{tag}.png" if tag else "table1_mae_by_horizon.png")
 
     if args.run:
         run_all(set(args.skip), args.seeds, args.data_dir, runs, args.epochs)
 
     test = load_results(reports, runs)
-    test.to_csv(reports / "comparison_all.csv", index=False)
-    print(f"saved {reports / 'comparison_all.csv'}")
+    test.to_csv(out / "comparison_all.csv", index=False)
+    print(f"saved {out / 'comparison_all.csv'}")
 
     if "main" in args.groups:
-        order = table1(test, reports)
+        order = table1(test, out)
         rq1_paired(test)
-        plot_table1(test, order)
+        plot_table1(test, order, figure)
     if "rq2" in args.groups:
-        table2(test, reports)
+        table2(test, out, runs)
     if "ablation" in args.groups:
-        table3(test, reports)
+        table3(test, out)
+    size_table(reports)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+model,peak_gb,epoch_s,train_s,n_params,scalars_exchanged,MAE 60 min,seeds
+Full-city (no attn),3.99,13.6,2609.6,7993,0,61.0,1
+No exchange (no attn),2.14,9.3,1386.7,7993,0,60.8,1
+Aware router (no attn),2.15,20.2,2980.7,7993,68,60.8,1

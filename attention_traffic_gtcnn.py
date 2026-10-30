@@ -36,6 +36,7 @@ C_TAPS = 3  # graph filter order (number of taps); 1 = self only
 A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
 N_FEAT = 32  # features before concat and graph filter. 8-12 is good
 HIDDEN = 64  # features after concat, these are much cheaper. Also the size of a district token
+DEFAULT_SIZE = (WINDOW, N_FEAT, HIDDEN)  # --window --n-feat --hidden; another size gets its own name and files
 DISTRICT_K = 5  # District node picks this many nodes using attention
 ATTN = "district"  # local attention: "district", "shared" (neighbours only) or "none". --attn on the command line
 K = 2  # other-district tokens each district reads; 0 = partitioned, no exchange. --k
@@ -740,25 +741,32 @@ def district_bench(d: District, time_feats, reps=10):
 
 # --------------------------------------------------------------- main
 
+def size_suffix(args, sep=", ") -> str:
+    """'' for the default size, else e.g. ', W=4 F=16 H=32', so other sizes never replace its rows."""
+    size = (args.window, args.n_feat, args.hidden)
+    return "" if size == DEFAULT_SIZE else sep + "W={} F={} H={}".format(*size)
+
+
 def run_name(args) -> str:
     """Model name in graph_results.csv, built from the flags."""
     name = MODEL_NAMES[args.attn]
     if args.partition == "none":
-        return f"Full-city {name}"
-    if args.k == 0:
-        return f"{name} (no exchange)"
-    name += f", {args.router} router K={args.k}"
-    if args.router == "aware" and args.gate == "off":
-        name += ", no gate"
-    if args.prior:
-        name += ", edge prior"
-    if args.exchange == "full":
-        name += ", full exchange"
-    return name
+        name = f"Full-city {name}"
+    elif args.k == 0:
+        name += " (no exchange)"
+    else:
+        name += f", {args.router} router K={args.k}"
+        if args.router == "aware" and args.gate == "off":
+            name += ", no gate"
+        if args.prior:
+            name += ", edge prior"
+        if args.exchange == "full":
+            name += ", full exchange"
+    return name + size_suffix(args)
 
 
 def main():
-    global EPOCHS, DATA_DIR
+    global EPOCHS, DATA_DIR, WINDOW, N_FEAT, HIDDEN
     parser = argparse.ArgumentParser()
     parser.add_argument("--attn", choices=list(MODEL_NAMES), default=ATTN, help="local attention inside a district")
     parser.add_argument("--k", type=int, default=K, help="other-district tokens each district reads, 0 = none")
@@ -773,8 +781,12 @@ def main():
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--window", type=int, default=WINDOW, help="input timesteps")
+    parser.add_argument("--n-feat", type=int, default=N_FEAT, help="graph filter output features")
+    parser.add_argument("--hidden", type=int, default=HIDDEN, help="hidden layers and district token size")
     args = parser.parse_args()
     EPOCHS, DATA_DIR = args.epochs, args.data_dir
+    WINDOW, N_FEAT, HIDDEN = args.window, args.n_feat, args.hidden  # before the City and model are built
     if args.partition == "none":
         args.k = 0  # one graph, nobody to exchange with
 
@@ -845,7 +857,8 @@ def main():
     tag = time.strftime("%Y%m%d_%H%M")
     Path("checkpoints").mkdir(exist_ok=True)
     slug = f"{args.partition}_{args.attn}_k{args.k}_{args.router}" + ("_nogate" if args.gate == "off" else "") \
-           + ("_prior" if args.prior else "") + ("_full" if args.exchange == "full" else "")
+           + ("_prior" if args.prior else "") + ("_full" if args.exchange == "full" else "") \
+           + size_suffix(args, "_").replace("=", "").replace(" ", "_")
     ckpt_path = f"checkpoints/gtcnn_{slug}_seed{args.seed}_{tag}.pt"
     save_checkpoint(model, ckpt_path, [d.id for d in city.districts], best_epoch, args.seed,
                     dict(partition=args.partition, exchange=args.exchange, data_dir=str(DATA_DIR)))

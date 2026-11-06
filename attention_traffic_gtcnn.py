@@ -46,8 +46,15 @@ ROUTER = "aware"  # "aware": tokens carry their support (live share, age); "traf
 EPOCHS = 1000       # upper bound; early stopping on validation can stop earlier
 PATIENCE = 25       # stop after this many epochs without val improvement
 MIN_DELTA = 0.01    # vehicles/hour; smaller val improvements do not count
-LR = 1e-3           # learning rate
-Gamma_LR = 0.985    # LR = LR * Gamma_LR ** epochs. An epoch is one pass over every district
+LR = 1e-2           # initial learning rate
+
+# ReduceLROnPlateau monitors pooled validation MAE (vehicles/hour).
+PLATEAU_FACTOR = 0.5
+PLATEAU_PATIENCE = 8
+PLATEAU_THRESHOLD = MIN_DELTA
+PLATEAU_COOLDOWN = 2
+MIN_LR = 1e-5
+
 SEED = 0
 
 """
@@ -860,7 +867,16 @@ def main():
     encode = torch.compile(model.encode) if COMPILE and not args.no_compile else model.encode
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=Gamma_LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=PLATEAU_FACTOR,
+        patience=PLATEAU_PATIENCE,
+        threshold=PLATEAU_THRESHOLD,
+        threshold_mode="abs",
+        cooldown=PLATEAU_COOLDOWN,
+        min_lr=MIN_LR,
+    )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     sync = (torch.cuda.synchronize if device.type == "cuda"
@@ -875,13 +891,13 @@ def main():
         va = float(np.mean(va_mae))  # model selection: val MAE in vehicles/hour, mean over horizons
         sync()
         epoch_times.append(time.perf_counter() - t0)  # train + val pass, like rq1/NN.py
-        scheduler.step()
+        scheduler.step(va)
         if va < best_val - MIN_DELTA:
             best_val, best_epoch = va, epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         print(f"epoch {epoch:3d}  train mae {tr:.4f} (std units)  val mae {va:7.2f} veh/h"
               f" [{' '.join(f'{v:.1f}' for v in va_mae)}]"
-              f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}"
+              f"  {time.perf_counter() - t0:.1f}s/epoch  lr {optimizer.param_groups[0]['lr']:.1e}"
               f"{'  *' if best_epoch == epoch else ''}", flush=True)
         if epoch - best_epoch >= PATIENCE:
             print(f"early stop at epoch {epoch}: no val improvement > {MIN_DELTA} veh/h for {PATIENCE} epochs")
@@ -941,3 +957,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

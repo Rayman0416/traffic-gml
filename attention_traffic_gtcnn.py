@@ -10,6 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import datetime
+import pandas as pd
 
 matplotlib.use("Agg")
 
@@ -117,6 +118,37 @@ def cross_district_prior(ids, device) -> torch.Tensor:
                     w[i, j] += float(e["weight"])
     return torch.from_numpy(np.log1p(w)).to(device)
 
+def radial_district_mask(ids, device, epsilon=4.0):
+    sensors = pd.read_csv("data/traffic_sensors.csv")
+
+    center_lat = 40.4168
+    center_lon = -3.7038
+
+    lat1 = np.radians(sensors["latitude"].to_numpy())
+    lon1 = np.radians(sensors["longitude"].to_numpy())
+    lat2 = np.radians(center_lat)
+    lon2 = np.radians(center_lon)
+
+    dlat = lat1 - lat2
+    dlon = lon1 - lon2
+
+    # haversine formula for the distance between two points
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    distances = 6371 * 2 * np.arcsin(np.sqrt(a))
+
+    sensors["radius"] = distances
+    district_radii = sensors.groupby("district")["radius"].mean() # take the mean distance to center for every district
+    radii = np.array([district_radii.loc[d] for d in ids])
+
+    mask = np.abs(radii[:, None] - radii[None, :]) <= epsilon
+    np.fill_diagonal(mask, False) # prevent self-edges
+
+    mask = torch.tensor(mask, dtype=torch.bool, device=device)
+    empty = ~mask.any(dim=1)
+    mask[empty] = ~torch.eye(len(ids), dtype=torch.bool, device=device)[empty]
+
+    return mask
+
 
 @lru_cache(maxsize=1)
 def shared_data():
@@ -174,6 +206,13 @@ class City:
         self.districts = [District(d, device) for d in ids]
         self.time = torch.from_numpy(shared_data()["time"]).to(device)
         self.log_w = cross_district_prior(ids, device)
+
+        self.district_mask = radial_district_mask(ids, device)
+        self.district_mask.fill_diagonal_(False)
+
+        empty = ~self.district_mask.any(dim=1)
+        self.district_mask[empty] = ~torch.eye(len(ids), dtype=torch.bool, device=device)[empty]
+
         self.origins = self.districts[0].origins  # the same windows for every district
         print(f"  loaded districts {ids} in {time.perf_counter() - t0:.1f}s")
 
@@ -336,12 +375,13 @@ class SupportRouter(nn.Module):
         self.beta = nn.Parameter(torch.zeros(())) if prior else None
         self.last = None  # (picked districts [B, D, K], weights [B, D, K]) of the last call, for analysis
 
-    def forward(self, u, s, log_w):  # u [B, D, F] tokens, s [B, D, 2] support, log_w [D, D]
+    def forward(self, u, s, log_w, district_mask):  # u [B, D, F] tokens, s [B, D, 2] support, log_w [D, D]
         B, D, f = u.shape
         if self.k == 0 or D == 1:
             return torch.zeros_like(u)
         keys = self.key(torch.cat([u, s], -1) if self.aware else u)
         e = self.q(u) @ keys.transpose(1, 2) / f ** 0.5  # [B, D receivers, D sources]
+        e = e.masked_fill(~district_mask[None], float("-inf")) # only attend to the neighboring districts
         if self.beta is not None:
             e = e + self.beta * log_w
         e = e.masked_fill(torch.eye(D, dtype=torch.bool, device=u.device), float("-inf"))  # never itself
@@ -480,7 +520,7 @@ def city_outputs(model, city, origins, encode, exchange="detached"):
             outs.append((*encode(X, d.S, d.reach), y, mask))
         u = torch.stack([h.mean(1) for h, _, _, _ in outs], 1)
         s = torch.stack([support(d, origins) for d in ds], 1)
-        r = model.router(u, s, city.log_w)
+        r = model.router(u, s, city.log_w, city.district_mask)
         for di, (h, last, y, mask) in enumerate(outs):
             yield model.decode(h, last, r[:, di]), y, mask
         return
@@ -488,14 +528,14 @@ def city_outputs(model, city, origins, encode, exchange="detached"):
     u, s = tokens(model, city, origins, encode)
     training = torch.is_grad_enabled()
     if not training:  # evaluation: the tokens are exact, so one router call serves every district
-        r = model.router(u, s, city.log_w)
+        r = model.router(u, s, city.log_w, city.district_mask)
     for di, d in enumerate(ds):
         X, y, mask = gather(d, city.time, origins)
         h, last = encode(X, d.S, d.reach)
         if training:
             u_d = u.clone()
             u_d[:, di] = h.mean(1)  # own token with gradients, the others fixed
-            r_d = model.router(u_d, s, city.log_w)[:, di]
+            r_d = model.router(u_d, s, city.log_w, city.district_mask)[:, di]
         else:
             r_d = r[:, di]
         yield model.decode(h, last, r_d), y, mask
@@ -600,7 +640,7 @@ def router_stats(model, city, split, path):
 
     def step(oc):
         u, s = tokens(model, city, oc, model.encode)
-        model.router(u, s, city.log_w)
+        model.router(u, s, city.log_w, city.district_mask)
         idx, alpha = model.router.last
         picks.append(idx.cpu()), weights.append(alpha.cpu()), sup.append(s.cpu())
 

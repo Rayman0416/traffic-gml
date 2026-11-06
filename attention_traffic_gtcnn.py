@@ -16,18 +16,25 @@ matplotlib.use("Agg")
 Hyper-Perameters with explination
 """
 DATA_DIR = Path("data/forecast_dataset")
-DISTRICTS = [4, 3, 6, 10, 2, 13, 14]
-EPOCHS_PER_DISTRICT = 25 # Try not to make this too low. Swapping wastes time
-WINDOW = 4  # input window in timesteps (features.npz history_length). Does what you think it does
-C_TAPS = 3  # graph filter order (number of taps); 1 = self only
-A_TAPS = 1  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
-N_FEAT = 12  # features before concat and graph filter. 8-12 is good
-HIDDEN = 12  # features after concat, these are much cheaper. Maybe we add some extra layers here?
+DISTRICTS = [4, 3, 2]
+EPOCHS_PER_DISTRICT = 40  # Try not to make this too low. Swapping wastes time
+WINDOW = 6  # input window in timesteps (features.npz history_length). Does what you think it does
+C_TAPS = 2  # graph filter order (number of taps); 1 = self only
+A_TAPS = 3  # attention neighbourhood in hops; 1 = 1-hop neighbours (+ self)
+N_FEAT = 18  # features before concat and graph filter. 8-12 is good
+HIDDEN = 48  # features after concat, these are much cheaper. Maybe we add some extra layers here?
 DISTRICT_K = 5  # District node picks this many nodes using attention
 
-EPOCHS = 1000       # well, you know what this is :)
-LR = 5e-2           # learning rate
-Gamma_LR = 0.991    # LR = LR * Gamma_LR ** epochs
+EPOCHS = 2000       # well, you know what this is :)
+LR = 2e-2           # AdamW starting learning rate
+WEIGHT_DECAY = 1e-4  # decoupled L2 regularisation for weight matrices
+
+# ReduceLROnPlateau monitors the full validation MSE.
+PLATEAU_FACTOR = 0.5
+PLATEAU_PATIENCE = 10
+PLATEAU_THRESHOLD = 1e-3
+PLATEAU_COOLDOWN = 1
+MIN_LR = 1e-5
 
 """
 Less hyper perameters probalby do not change
@@ -36,7 +43,7 @@ EVAL_DISTRICTS = list(range(1, 22))  # evaluated on after training: districts 1-
 COMPILE = True  # recompiles at every district switch (N changes)
 HORIZON = 2  # How many timesteps ahead to predict. 2 = 30 min
 BATCH_SIZE = int(2 ** 10) # How to batch
-PLOT_FIGURES = False  # False skips the 10 figures per district, good for debug
+PLOT_FIGURES = True  # False skips the 10 figures per district, good for debug
 
 # ---------------------------------------------------------------- data
 
@@ -103,7 +110,7 @@ def shared_data():  # This saves a lof time in the multi district trainng!
     names = list(z["time_feature_names"])
     tf = z["time_features"]
     tod_sin = tf[:, names.index("tod_sin")].astype(np.float32)
-    day_sin2 = (np.sin(np.pi * np.arange(len(tf)) / 96.0) ** 2).astype(np.float32)
+    day_sin2 = tf[:, names.index("tod_cos")].astype(np.float32)  #(np.sin(np.pi * np.arange(len(tf)) / 96.0) ** 2).astype(np.float32)
 
     with open(DATA_DIR / "windows.csv") as f:
         rows = list(csv.DictReader(f))
@@ -300,7 +307,7 @@ class GTCNN(nn.Module):
         z = torch.relu(self.filter1(x))  # [B, T, N, F]
         #z = torch.square(self.filter1(x)) #todo try this
         z = z.permute(0, 2, 1, 3).flatten(2)  # [B, N, T*F]
-        z = torch.relu(self.fc(z))  # <-- hidden layer + activation
+        z = torch.sigmoid(self.fc(z))  # <-- hidden layer + activation
         z = torch.relu(self.fc2(z))
         return self.head(z).squeeze(-1)  # [B, N]
 
@@ -327,6 +334,12 @@ def masked_mae(pred, y, mask):
 def run_epoch(model, X, y, mask, optimizer=None):
     model.train(optimizer is not None)
 
+    # Aggregate over every valid target in the epoch. This gives
+    # ReduceLROnPlateau a stable validation metric instead of only the last batch.
+    total_squared_error = torch.zeros((), device=X.device)
+    total_absolute_error = torch.zeros((), device=X.device)
+    total_valid = torch.zeros((), device=X.device)
+
     for b in range(0, len(X), BATCH_SIZE):
         xb, yb, mb = X[b:b + BATCH_SIZE], y[b:b + BATCH_SIZE], mask[b:b + BATCH_SIZE]
         with torch.set_grad_enabled(optimizer is not None):
@@ -337,8 +350,13 @@ def run_epoch(model, X, y, mask, optimizer=None):
                 loss.backward()
                 optimizer.step()
 
-    # Zero syncs or accumulation in the loop. Return the raw tensors from the LAST batch.
-    return loss.detach(), masked_mae(pred.detach(), yb, mb)
+        valid = mb.sum()
+        total_squared_error += ((pred.detach() - yb) ** 2 * mb).sum()
+        total_absolute_error += ((pred.detach() - yb).abs() * mb).sum()
+        total_valid += valid
+
+    denominator = total_valid.clamp(min=1)
+    return total_squared_error / denominator, total_absolute_error / denominator
 
 
 def chunked_linear(x, W, bias, chunks=512):  # x [..., K], W [F_out, K]
@@ -411,8 +429,32 @@ def main():
     print(f"device={device} districts={DISTRICTS} epochs/district={EPOCHS_PER_DISTRICT} "
           f"parameters={sum(p.numel() for p in model.parameters()):,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=Gamma_LR)
+    # AdamW with decay applied only to matrix/tensor weights. Biases and
+    # one-dimensional parameters (e.g. attention scoring vectors) are not decayed.
+    decay_params = [
+        p for p in model.parameters()
+        if p.requires_grad and p.ndim >= 2
+    ]
+    no_decay_params = [
+        p for p in model.parameters()
+        if p.requires_grad and p.ndim < 2
+    ]
+    param_groups = [
+        {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+    optimizer_kwargs = dict(
+        lr=LR,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
+    # Fused AdamW is the fast CUDA implementation. Keep the default backend
+    # on MPS/CPU for compatibility.
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+
+    optimizer = torch.optim.AdamW(param_groups, **optimizer_kwargs)
     current, run_model = None, model
     train_start = time.perf_counter()
     for epoch in range(1, EPOCHS + 1):
@@ -428,13 +470,25 @@ def main():
             print(f"--- district {d}: {len(cols)} sensors, "
                   + ", ".join(f"{s} {len(data[s][0]):,}" for s in data) + " windows")
             current = d
+            # Reset scheduler for the new district.
+            # The optimizer and its current learning rate remain unchanged.
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=PLATEAU_FACTOR,
+                patience=PLATEAU_PATIENCE,
+                threshold=PLATEAU_THRESHOLD,
+                threshold_mode="rel",
+                cooldown=PLATEAU_COOLDOWN,
+                min_lr=MIN_LR,
+            )
         t0 = time.perf_counter()
         tr_mse, tr_mae = run_epoch(run_model, *data["train"][:3], optimizer)
         va_mse, va_mae = run_epoch(run_model, *data["val"][:3])
-        scheduler.step()
+        scheduler.step(va_mse.item())
         print(f"epoch {epoch:2d} d{d:<2d} train mse {tr_mse:.4f} mae {tr_mae:.4f}"
               f"  val mse {va_mse:.4f} mae {va_mae:.4f}"
-              f"  {time.perf_counter() - t0:.1f}s/epoch  lr {scheduler.get_last_lr()[0]:.1e}",
+              f"  {time.perf_counter() - t0:.1f}s/epoch  lr {optimizer.param_groups[0]['lr']:.1e}",
               flush=True)
     train_seconds = time.perf_counter() - train_start
     print(f"training time {train_seconds:.1f}s ({EPOCHS} epochs, {train_seconds / EPOCHS:.1f}s/epoch)")
@@ -475,3 +529,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
